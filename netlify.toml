@@ -4,5 +4,5 @@
   publish = "public"
 
 [[edge_functions]]
-  path = "/xblog"
+  path = "/xblog/*"
   function = "vless"
