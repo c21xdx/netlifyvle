@@ -336,37 +336,59 @@ async function startDataRelay(
             // 在实际场景中，这里应该将数据发送到远程服务器
         }
         
-        // 模拟数据转发
-        setTimeout(async () => {
-            try {
-                // 模拟从远程服务器收到的响应
-                const mockResponse = new TextEncoder().encode("HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\r\n<html><body>Hello from VLESS proxy!</body></html>");
-                await clientWriter.write(mockResponse);
-                log('debug', `已发送模拟响应: ${mockResponse.length} 字节`);
-                
-                // 继续读取客户端数据
-                while (true) {
-                    const { value, done } = await clientReader.read();
-                    if (done) {
-                        log('debug', '客户端已关闭连接');
-                        break;
-                    }
-                    
-                    if (value) {
-                        log('debug', `收到客户端数据: ${value.length} 字节`);
-                        // 在实际场景中，这里应该将数据发送到远程服务器
-                    }
+        // 立即发送模拟响应，不使用 setTimeout
+        try {
+            // 模拟从远程服务器收到的响应
+            const mockResponse = new TextEncoder().encode("HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\r\n<html><body>Hello from VLESS proxy!</body></html>");
+            await clientWriter.write(mockResponse);
+            log('debug', `已发送模拟响应: ${mockResponse.length} 字节`);
+            
+            // 设置读取超时
+            const readTimeout = 5000; // 5秒超时
+            let lastActivity = Date.now();
+            
+            // 继续读取客户端数据
+            while (true) {
+                // 检查是否超时
+                if (Date.now() - lastActivity > readTimeout) {
+                    log('debug', '读取超时，关闭连接');
+                    break;
                 }
-            } catch (err) {
-                log('error', `数据转发错误: ${err.message}`);
-            } finally {
-                try {
-                    await clientWriter.close();
-                } catch (err) {
-                    log('error', `关闭写入器错误: ${err.message}`);
+                
+                // 使用 Promise.race 添加超时
+                const readPromise = clientReader.read();
+                const timeoutPromise = new Promise<{done: boolean, value: undefined}>((resolve) => {
+                    setTimeout(() => resolve({done: false, value: undefined}), 1000);
+                });
+                
+                const result = await Promise.race([readPromise, timeoutPromise]);
+                
+                if (result.done) {
+                    log('debug', '客户端已关闭连接');
+                    break;
+                }
+                
+                if (result.value) {
+                    lastActivity = Date.now();
+                    log('debug', `收到客户端数据: ${result.value.length} 字节`);
+                    // 在实际场景中，这里应该将数据发送到远程服务器
+                    
+                    // 模拟服务器响应
+                    const serverResponse = new TextEncoder().encode("HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\nResponse to your data");
+                    await clientWriter.write(serverResponse);
+                    log('debug', `已发送服务器响应: ${serverResponse.length} 字节`);
                 }
             }
-        }, 100);
+        } catch (err) {
+            log('error', `数据转发错误: ${err.message}`);
+        } finally {
+            log('debug', '关闭连接');
+            try {
+                await clientWriter.close();
+            } catch (err) {
+                log('error', `关闭写入器错误: ${err.message}`);
+            }
+        }
         
     } catch (err) {
         log('error', `启动数据转发错误: ${err.message}`);
