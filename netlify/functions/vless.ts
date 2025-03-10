@@ -180,43 +180,41 @@ async function handleVlessRequest(req: Request) {
         const vless = await read_vless_header(reader, SETTINGS.UUID);
         log('debug', `VLESS解析结果: 版本=${vless.version}, 目标=${vless.hostname}:${vless.port}`);
 
-        // 创建到目标的请求
+        // 建立到目标服务器的连接
         const remoteResponse = await connect_remote(vless.hostname, vless.port);
         log('debug', '成功建立远程连接，开始数据传输');
 
-        // 创建转换流
-        const transformStream = new TransformStream({
-            start(controller) {
-                controller.enqueue(vless.resp); // 首先发送 VLESS 响应头
-            },
-            transform(chunk, controller) {
-                controller.enqueue(chunk); // 转发所有数据
+        // 创建用于发送VLESS响应头的TransformStream
+        const vlessHeaderTransform = new TransformStream({
+            async start(controller) {
+                controller.enqueue(vless.resp);
             }
         });
 
-        // 创建响应
-        const response = new Response(remoteResponse.body?.pipeThrough(transformStream), {
+        // 创建主数据流的TransformStream
+        const dataTransform = new TransformStream({
+            async transform(chunk, controller) {
+                controller.enqueue(chunk);
+            }
+        });
+
+        // 串联转换流
+        let responseStream = remoteResponse.body;
+        if (responseStream) {
+            responseStream = responseStream
+                .pipeThrough(dataTransform)
+                .pipeThrough(vlessHeaderTransform);
+        }
+
+        // 返回响应
+        return new Response(responseStream, {
             status: 200,
             headers: {
                 'Content-Type': 'application/octet-stream',
                 'Connection': 'keep-alive',
-                'Cache-Control': 'no-store',
+                'Cache-Control': 'no-store'
             }
         });
-
-        // 设置请求完成时的清理
-        response.body?.pipeTo(new WritableStream({
-            close() {
-                log('debug', '数据传输完成');
-            },
-            abort(err) {
-                log('error', '数据传输异常:', err);
-            }
-        })).catch(err => {
-            log('error', '数据管道错误:', err);
-        });
-
-        return response;
 
     } catch (err) {
         log('error', `处理VLESS请求失败: ${err.message}`);
