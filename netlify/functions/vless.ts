@@ -245,11 +245,14 @@ async function handleRequest(request: Request): Promise<Response> {
     } else if (request.method === 'GET' && url.pathname.includes(SETTINGS.XHTTP_PATH)) {
         // 处理 GET 请求，可能是客户端的初始化请求
         log('debug', `收到 GET 请求，可能是客户端初始化: ${url.pathname}`);
-        return new Response("OK", { 
+        return new Response("Netlify Edge VLESS Server Ready", { 
             status: 200,
             headers: {
                 'Content-Type': 'text/plain',
-                'X-Request-Id': Math.random().toString(36).substring(2)
+                'X-Request-Id': Math.random().toString(36).substring(2),
+                'Cache-Control': 'no-store, no-cache, must-revalidate, proxy-revalidate',
+                'Pragma': 'no-cache',
+                'Expires': '0'
             }
         });
     }
