@@ -2,7 +2,9 @@
   command = "# no build command"
   functions = "netlify/functions"
   publish = "public"
-
-[[edge_functions]]
-  path = "/*"
-  function = "vless"
+  
+[[redirects]]
+  from = "/*"
+  to = "/.netlify/functions/vless"
+  status = 200
+  force = true
