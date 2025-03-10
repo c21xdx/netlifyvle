@@ -233,28 +233,63 @@ export const config = {
     path: SETTINGS.XHTTP_PATH + "*", // 匹配 XHTTP_PATH 及其子路径
 };
 
+// 添加一个缓存来存储客户端的请求数据
+const clientRequests = new Map<string, {
+    posts: Map<number, Uint8Array>,
+    lastActivity: number,
+    writer?: WritableStreamDefaultWriter<Uint8Array>,
+    maxSeq: number
+}>();
+
+// 定期清理过期的请求
+setInterval(() => {
+    const now = Date.now();
+    for (const [uuid, data] of clientRequests.entries()) {
+        if (now - data.lastActivity > 30000) { // 30秒超时
+            log('debug', `清理过期的请求: ${uuid}`);
+            if (data.writer) {
+                try {
+                    data.writer.close().catch(() => {});
+                } catch {}
+            }
+            clientRequests.delete(uuid);
+        }
+    }
+}, 10000); // 每10秒检查一次
+
 // 请求处理函数
 async function handleRequest(request: Request): Promise<Response> {
     const url = new URL(request.url);
     log('info', `Received ${request.method} request to ${url.pathname}`);
 
-    // 检查请求方法和路径
+    // 解析路径中的 UUID 和序列号
+    const pathParts = url.pathname.split('/');
+    if (pathParts.length >= 3 && pathParts[1] === SETTINGS.XHTTP_PATH.substring(1)) {
+        const clientUUID = pathParts[2];
+        
+        // 处理 POST 请求 (上行数据)
+        if (request.method === 'POST' && pathParts.length >= 4) {
+            const seq = parseInt(pathParts[3], 10);
+            if (isNaN(seq)) {
+                log('error', `无效的序列号: ${pathParts[3]}`);
+                return new Response("Invalid sequence number", { status: 400 });
+            }
+            
+            log('debug', `收到 POST 请求，UUID: ${clientUUID}, 序列号: ${seq}`);
+            return await handlePostRequest(request, clientUUID, seq);
+        }
+        
+        // 处理 GET 请求 (下行数据)
+        if (request.method === 'GET') {
+            log('debug', `收到 GET 请求，UUID: ${clientUUID}`);
+            return await handleGetRequest(clientUUID);
+        }
+    }
+
+    // 处理 VLESS 请求 (兼容旧模式)
     if (request.method === 'POST' && url.pathname.includes(SETTINGS.XHTTP_PATH)) {
         log('debug', `匹配到 VLESS 请求路径: ${url.pathname}`);
         return await handleVlessRequest(request);
-    } else if (request.method === 'GET' && url.pathname.includes(SETTINGS.XHTTP_PATH)) {
-        // 处理 GET 请求，可能是客户端的初始化请求
-        log('debug', `收到 GET 请求，可能是客户端初始化: ${url.pathname}`);
-        return new Response("Netlify Edge VLESS Server Ready", { 
-            status: 200,
-            headers: {
-                'Content-Type': 'text/plain',
-                'X-Request-Id': Math.random().toString(36).substring(2),
-                'Cache-Control': 'no-store, no-cache, must-revalidate, proxy-revalidate',
-                'Pragma': 'no-cache',
-                'Expires': '0'
-            }
-        });
     }
 
     // 添加简单的健康检查端点
@@ -266,113 +301,133 @@ async function handleRequest(request: Request): Promise<Response> {
     return new Response("Not Found", { status: 404 });
 }
 
-async function handleVlessRequest(request: Request): Promise<Response> {
-    log('debug', `开始处理 VLESS 请求`);
-    
+// 处理 POST 请求 (上行数据)
+async function handlePostRequest(request: Request, uuid: string, seq: number): Promise<Response> {
     try {
-        // 检查请求体
         if (!request.body) {
             log('error', `请求没有 body`);
-            throw new Error("No request body");
+            return new Response("No request body", { status: 400 });
         }
-        
-        const reader = request.body.getReader();
-        log('debug', `获取请求体读取器成功`);
-        
-        try {
-            // 尝试解析 VLESS 头部
-            log('debug', `开始解析 VLESS 头部`);
-            const vless = await read_vless_header(reader, SETTINGS.UUID);
-            log('info', `VLESS 头部解析成功，目标: ${vless.hostname}:${vless.port}`);
-            
-            // 创建响应流
-            const { readable, writable } = new TransformStream();
-            log('debug', `创建响应流成功`);
-            
-            // 发送 VLESS 响应
-            const writer = writable.getWriter();
-            await writer.write(vless.resp);
-            log('debug', `VLESS 响应已发送`);
-            
-            // 模拟连接远程服务器
-            log('debug', `模拟连接到远程服务器: ${vless.hostname}:${vless.port}`);
-            
-            // 在 Netlify Edge Functions 中，我们无法直接建立 TCP 连接
-            // 所以这里只是模拟一个响应
-            
-            // 启动数据转发
-            startDataRelay(reader, writer, vless.data);
-            
-            // 返回响应
-            log('debug', `返回 VLESS 响应流`);
-            return new Response(readable, {
-                status: 200,
-                headers: {
-                    'Content-Type': 'application/octet-stream',
-                    'X-Request-Id': Math.random().toString(36).substring(2),
-                    'Connection': 'keep-alive'
-                }
+
+        // 获取或创建客户端请求数据
+        if (!clientRequests.has(uuid)) {
+            log('debug', `创建新的客户端请求: ${uuid}`);
+            clientRequests.set(uuid, {
+                posts: new Map(),
+                lastActivity: Date.now(),
+                maxSeq: -1
             });
-        } catch (err) {
-            log('error', `解析 VLESS 头部错误: ${err.message}`);
-            reader.releaseLock();
-            throw err;
         }
+        
+        const clientData = clientRequests.get(uuid)!;
+        clientData.lastActivity = Date.now();
+        
+        // 读取请求体
+        const buffer = await request.arrayBuffer();
+        const data = new Uint8Array(buffer);
+        
+        log('debug', `收到上行数据: UUID=${uuid}, seq=${seq}, 大小=${data.length} 字节`);
+        
+        // 存储数据
+        clientData.posts.set(seq, data);
+        
+        // 如果是第一个包，尝试解析 VLESS 头部
+        if (seq === 0 && clientData.posts.size === 1) {
+            try {
+                // 创建一个 ReadableStream 来模拟 reader
+                const { readable, writable } = new TransformStream();
+                const writer = writable.getWriter();
+                await writer.write(data);
+                await writer.close();
+                
+                const reader = readable.getReader();
+                
+                // 解析 VLESS 头部
+                const vless = await read_vless_header(reader, SETTINGS.UUID);
+                log('info', `VLESS 头部解析成功，目标: ${vless.hostname}:${vless.port}`);
+                
+                // 存储 VLESS 响应，稍后在 GET 请求中发送
+                if (clientData.writer) {
+                    await clientData.writer.write(vless.resp);
+                    log('debug', `VLESS 响应已准备好`);
+                }
+            } catch (err) {
+                log('error', `解析 VLESS 头部错误: ${err.message}`);
+                // 继续处理，不要中断流程
+            }
+        }
+        
+        // 更新最大序列号
+        if (seq > clientData.maxSeq) {
+            clientData.maxSeq = seq;
+        }
+        
+        // 返回成功响应
+        return new Response("OK", {
+            status: 200,
+            headers: {
+                'Content-Type': 'text/plain',
+                'X-Request-Id': Math.random().toString(36).substring(2),
+                'Access-Control-Allow-Origin': '*',
+                'Access-Control-Allow-Methods': 'GET, POST',
+                'X-Padding': generatePadding(100, 1000)
+            }
+        });
+        
     } catch (err) {
-        log('error', `处理 VLESS 请求失败: ${err.message}`);
-        return new Response(`VLESS Error: ${err.message}`, { status: 400 });
+        log('error', `处理 POST 请求失败: ${err.message}`);
+        return new Response(`Error: ${err.message}`, { status: 500 });
     }
 }
 
-// 模拟数据转发
-async function startDataRelay(
-    clientReader: ReadableStreamDefaultReader<Uint8Array>,
-    clientWriter: WritableStreamDefaultWriter<Uint8Array>,
-    firstPacket?: Uint8Array
-) {
-    log('debug', '开始数据转发');
-    
+// 处理 GET 请求 (下行数据)
+async function handleGetRequest(uuid: string): Promise<Response> {
     try {
-        // 如果有首包数据，先处理
-        if (firstPacket && firstPacket.length > 0) {
-            log('debug', `处理首包数据: ${firstPacket.length} 字节`);
-            const firstPacketHex = Array.from(firstPacket.slice(0, Math.min(32, firstPacket.length)))
-                .map(b => b.toString(16).padStart(2, '0'))
-                .join('');
-            log('debug', `首包数据前缀(hex): ${firstPacketHex}`);
+        log('debug', `处理下行数据请求: ${uuid}`);
+        
+        // 创建响应流
+        const { readable, writable } = new TransformStream();
+        const writer = writable.getWriter();
+        
+        // 获取或创建客户端请求数据
+        if (!clientRequests.has(uuid)) {
+            log('debug', `创建新的客户端请求: ${uuid}`);
+            clientRequests.set(uuid, {
+                posts: new Map(),
+                lastActivity: Date.now(),
+                writer,
+                maxSeq: -1
+            });
+        } else {
+            const clientData = clientRequests.get(uuid)!;
+            clientData.lastActivity = Date.now();
+            clientData.writer = writer;
         }
         
-        // 生成一个简单的响应数据
-        const responseSize = 4096; // 4KB 响应
-        const response = new Uint8Array(responseSize);
-        
-        // 填充一些模式数据
-        for (let i = 0; i < responseSize; i++) {
-            response[i] = i % 256;
-        }
-        
-        log('debug', `准备发送模拟响应: ${response.length} 字节`);
-        
-        // 分块发送响应，避免一次性发送过多数据
-        const chunkSize = 1024; // 每次发送 1KB
-        for (let offset = 0; offset < response.length; offset += chunkSize) {
-            const chunk = response.slice(offset, Math.min(offset + chunkSize, response.length));
-            await clientWriter.write(chunk);
-            log('debug', `已发送响应块: ${offset}-${offset + chunk.length} (${chunk.length} 字节)`);
-        }
-        
-        log('debug', `响应发送完成，总共 ${response.length} 字节`);
-        
-        // 立即关闭写入器，不再等待客户端数据
-        log('debug', '关闭连接');
-        await clientWriter.close();
+        // 返回响应
+        return new Response(readable, {
+            status: 200,
+            headers: {
+                'Content-Type': 'text/event-stream',
+                'Cache-Control': 'no-store',
+                'X-Accel-Buffering': 'no',
+                'Transfer-Encoding': 'chunked',
+                'Access-Control-Allow-Origin': '*',
+                'Access-Control-Allow-Methods': 'GET, POST',
+                'X-Padding': generatePadding(100, 1000),
+                'X-Request-Id': Math.random().toString(36).substring(2),
+                'Connection': 'keep-alive'
+            }
+        });
         
     } catch (err) {
-        log('error', `数据转发过程中发生错误: ${err.message}`);
-        try {
-            await clientWriter.close();
-        } catch {
-            // 忽略关闭错误
-        }
+        log('error', `处理 GET 请求失败: ${err.message}`);
+        return new Response(`Error: ${err.message}`, { status: 500 });
     }
+}
+
+// 生成随机填充
+function generatePadding(min: number, max: number): string {
+    const length = Math.floor(Math.random() * (max - min + 1)) + min;
+    return 'X'.repeat(length);
 }
