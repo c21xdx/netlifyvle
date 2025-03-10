@@ -181,20 +181,9 @@ async function handleVlessRequest(req: Request) {
         log('debug', `VLESS解析结果: 版本=${vless.version}, 目标=${vless.hostname}:${vless.port}`);
 
         // 建立到目标服务器的连接
-        const remoteResponse = await connect_remote(vless.hostname, vless.port, {
-            method: 'POST',
-            body: vless.data, // 发送剩余数据
-            headers: {
-                'Host': vless.hostname,
-                'Connection': 'keep-alive'
-            }
-        });
+        const remoteResponse = await connect_remote(vless.hostname, vless.port);
 
-        // 构造响应
-        const headers = new Headers(remoteResponse.headers);
-        headers.set('Content-Type', 'application/octet-stream');
-
-        // 创建最终响应流
+        // 创建响应流
         const { readable, writable } = new TransformStream();
         const writer = writable.getWriter();
 
@@ -202,11 +191,22 @@ async function handleVlessRequest(req: Request) {
         writer.write(vless.resp);
         
         // 转发远程响应数据
-        remoteResponse.body?.pipeTo(writable);
+        if (remoteResponse.body) {
+            const reader = remoteResponse.body.getReader();
+            while (true) {
+                const { done, value } = await reader.read();
+                if (done) break;
+                await writer.write(value);
+            }
+            writer.close();
+        }
 
         return new Response(readable, {
             status: 200,
-            headers: headers
+            headers: {
+                'Content-Type': 'application/octet-stream',
+                'Connection': 'keep-alive'
+            }
         });
 
     } catch (err) {
@@ -219,26 +219,35 @@ async function handleVlessRequest(req: Request) {
 async function connect_remote(hostname: string, port: number, options: RequestInit = {}) {
     log('debug', `连接到远程服务器: ${hostname}:${port}`);
     try {
-        // 根据端口确定协议
         const protocol = port === 443 ? 'https' : 'http';
         const url = `${protocol}://${hostname}`;
         
-        // 添加必要的请求头
-        const headers = new Headers(options.headers);
-        headers.set('User-Agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36');
-        headers.set('Accept', '*/*');
-        headers.set('Accept-Language', 'en-US,en;q=0.9');
-        
+        // 基础请求头
+        const headers = {
+            'Host': hostname,
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
+            'Accept-Language': 'en-US,en;q=0.9',
+            'Accept-Encoding': 'gzip, deflate, br',
+            'Connection': 'keep-alive',
+            'Upgrade-Insecure-Requests': '1',
+            'Sec-Fetch-Dest': 'document',
+            'Sec-Fetch-Mode': 'navigate',
+            'Sec-Fetch-Site': 'none',
+            'Sec-Fetch-User': '?1',
+            'Cache-Control': 'no-cache',
+            'Pragma': 'no-cache',
+        };
+
         const response = await fetch(url, {
-            ...options,
-            headers,
+            method: 'GET',  // 改用 GET 方法
+            headers: headers,
             redirect: 'follow',
-            // 添加其他fetch选项
             cache: 'no-store',
             credentials: 'omit',
         });
         
-        if (!response.ok && response.status !== 101) { // 允许WebSocket升级
+        if (!response.ok && response.status !== 101) {
             throw new Error(`HTTP error! status: ${response.status}`);
         }
         
