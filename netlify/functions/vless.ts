@@ -180,16 +180,16 @@ async function handleVlessRequest(req: Request) {
         const vless = await read_vless_header(reader, SETTINGS.UUID);
         log('debug', `VLESS解析结果: 版本=${vless.version}, 目标=${vless.hostname}:${vless.port}`);
 
-        // 创建到目标服务器的请求体
+        // 创建转换流来处理请求数据
         const { readable, writable } = new TransformStream();
         const writer = writable.getWriter();
 
-        // 写入初始数据并处理后续数据流
+        // 写入之前读取的数据
         if (vless.data.length > 0) {
             await writer.write(vless.data);
         }
 
-        // 处理后续数据流
+        // 创建新的请求流处理器
         (async () => {
             try {
                 while (true) {
@@ -197,29 +197,37 @@ async function handleVlessRequest(req: Request) {
                     if (done) break;
                     await writer.write(value);
                 }
+            } catch (e) {
+                log('error', '处理请求数据失败:', e);
             } finally {
-                writer.close().catch(console.error);
+                writer.close().catch(() => {});
             }
         })();
 
-        // 发送请求到目标服务器
+        // 构建目标URL
         const protocol = vless.port === 443 ? 'https' : 'http';
-        const remoteResponse = await fetch(`${protocol}://${vless.hostname}`, {
-            method: 'POST',
-            duplex: 'half',  // 添加 duplex 选项
+        const targetUrl = `${protocol}://${vless.hostname}`;
+        log('debug', `请求目标: ${targetUrl}`);
+
+        // 发送到目标服务器
+        const remoteResponse = await fetch(targetUrl, {
+            method: req.method,
             headers: {
                 'Host': vless.hostname,
                 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/122.0.0.0',
-                'Connection': 'keep-alive'
+                'Accept': '*/*',
+                'Accept-Language': 'en-US,en;q=0.9',
+                'Accept-Encoding': 'gzip, deflate',
             },
-            body: readable
+            body: readable,
+            duplex: 'half',
         });
 
-        // 创建响应转换流
+        // 处理响应
         const { readable: processedReadable, writable: processedWritable } = new TransformStream();
         const responseWriter = processedWritable.getWriter();
 
-        // 写入 VLESS 响应头
+        // 写入VLESS响应头
         await responseWriter.write(vless.resp);
 
         // 转发响应数据
@@ -232,8 +240,10 @@ async function handleVlessRequest(req: Request) {
                         if (done) break;
                         await responseWriter.write(value);
                     }
+                } catch (e) {
+                    log('error', '处理响应数据失败:', e);
                 } finally {
-                    responseWriter.close().catch(console.error);
+                    responseWriter.close().catch(() => {});
                 }
             })();
         }
@@ -243,44 +253,13 @@ async function handleVlessRequest(req: Request) {
             headers: {
                 'Content-Type': 'application/octet-stream',
                 'Connection': 'keep-alive',
-                'Cache-Control': 'no-store'
+                'Cache-Control': 'no-store',
             }
         });
 
     } catch (err) {
         log('error', `处理VLESS请求失败: ${err.message}`);
         return new Response(`Internal Server Error: ${err.message}`, { status: 500 });
-    }
-}
-
-// 修改connect_remote函数
-async function connect_remote(hostname: string, port: number) {
-    log('debug', `连接到远程服务器: ${hostname}:${port}`);
-    try {
-        const protocol = port === 443 ? 'https' : 'http';
-        const url = `${protocol}://${hostname}`;
-        
-        const response = await fetch(url, {
-            method: 'GET',
-            headers: {
-                'Host': hostname,
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/122.0.0.0',
-                'Accept': '*/*',
-                'Accept-Language': 'en-US,en;q=0.9',
-                'Accept-Encoding': 'gzip, deflate',
-                'Connection': 'keep-alive'
-            }
-        });
-        
-        if (!response.ok && response.status !== 101) {
-            throw new Error(`HTTP error! status: ${response.status}`);
-        }
-        
-        log('debug', `远程连接成功: ${response.status}`);
-        return response;
-    } catch (err) {
-        log('error', `远程连接失败: ${err.message}`);
-        throw err;
     }
 }
 
