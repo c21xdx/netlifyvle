@@ -241,9 +241,9 @@ export default async function handler(req: Request, context: Context) {
     const url = new URL(req.url);
     log('info', `收到请求: ${req.method} ${url.pathname}`);
 
-    // 修改路径匹配逻辑
-    if (req.method === 'POST' && url.pathname === SETTINGS.XHTTP_PATH) {
-        log('info', '匹配到VLESS请求路径');
+    // 修改路径匹配逻辑：使用startsWith检查前缀
+    if (req.method === 'POST' && url.pathname.startsWith(SETTINGS.XHTTP_PATH)) {
+        log('info', `匹配到VLESS请求路径: ${url.pathname}`);
         return await handleVlessRequest(req);
     }
 
