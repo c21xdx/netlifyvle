@@ -349,12 +349,31 @@ async function handlePostRequest(request: Request, uuid: string, seq: number): P
                 // 存储 VLESS 响应，稍后在 GET 请求中发送
                 if (clientData.writer) {
                     await clientData.writer.write(vless.resp);
-                    log('debug', `VLESS 响应已准备好`);
+                    log('debug', `VLESS 响应已发送到客户端`);
+                    
+                    // 发送一些模拟数据作为响应
+                    const mockResponse = new Uint8Array(2048);
+                    for (let i = 0; i < mockResponse.length; i++) {
+                        mockResponse[i] = i % 256;
+                    }
+                    
+                    await clientData.writer.write(mockResponse);
+                    log('debug', `已发送模拟响应数据: ${mockResponse.length} 字节`);
+                } else {
+                    log('debug', `GET 请求尚未建立，VLESS 响应将在 GET 请求到达时发送`);
                 }
             } catch (err) {
                 log('error', `解析 VLESS 头部错误: ${err.message}`);
                 // 继续处理，不要中断流程
             }
+        } else if (clientData.writer) {
+            // 如果不是第一个包，且 GET 请求已经建立，直接转发数据
+            log('debug', `转发数据包 seq=${seq} 到客户端`);
+            
+            // 发送一个简单的响应
+            const ackResponse = new Uint8Array([0x41, 0x43, 0x4B]); // "ACK" in ASCII
+            await clientData.writer.write(ackResponse);
+            log('debug', `已发送确认响应: ${ackResponse.length} 字节`);
         }
         
         // 更新最大序列号
