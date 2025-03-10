@@ -180,34 +180,43 @@ async function handleVlessRequest(req: Request) {
         const vless = await read_vless_header(reader, SETTINGS.UUID);
         log('debug', `VLESS解析结果: 版本=${vless.version}, 目标=${vless.hostname}:${vless.port}`);
 
-        // 建立到目标服务器的连接
+        // 创建到目标的请求
         const remoteResponse = await connect_remote(vless.hostname, vless.port);
+        log('debug', '成功建立远程连接，开始数据传输');
 
-        // 创建响应流
-        const { readable, writable } = new TransformStream();
-        const writer = writable.getWriter();
-
-        // 写入VLESS响应头
-        writer.write(vless.resp);
-        
-        // 转发远程响应数据
-        if (remoteResponse.body) {
-            const reader = remoteResponse.body.getReader();
-            while (true) {
-                const { done, value } = await reader.read();
-                if (done) break;
-                await writer.write(value);
+        // 创建转换流
+        const transformStream = new TransformStream({
+            start(controller) {
+                controller.enqueue(vless.resp); // 首先发送 VLESS 响应头
+            },
+            transform(chunk, controller) {
+                controller.enqueue(chunk); // 转发所有数据
             }
-            writer.close();
-        }
+        });
 
-        return new Response(readable, {
+        // 创建响应
+        const response = new Response(remoteResponse.body?.pipeThrough(transformStream), {
             status: 200,
             headers: {
                 'Content-Type': 'application/octet-stream',
-                'Connection': 'keep-alive'
+                'Connection': 'keep-alive',
+                'Cache-Control': 'no-store',
             }
         });
+
+        // 设置请求完成时的清理
+        response.body?.pipeTo(new WritableStream({
+            close() {
+                log('debug', '数据传输完成');
+            },
+            abort(err) {
+                log('error', '数据传输异常:', err);
+            }
+        })).catch(err => {
+            log('error', '数据管道错误:', err);
+        });
+
+        return response;
 
     } catch (err) {
         log('error', `处理VLESS请求失败: ${err.message}`);
@@ -216,35 +225,22 @@ async function handleVlessRequest(req: Request) {
 }
 
 // 修改connect_remote函数
-async function connect_remote(hostname: string, port: number, options: RequestInit = {}) {
+async function connect_remote(hostname: string, port: number) {
     log('debug', `连接到远程服务器: ${hostname}:${port}`);
     try {
         const protocol = port === 443 ? 'https' : 'http';
         const url = `${protocol}://${hostname}`;
         
-        // 基础请求头
-        const headers = {
-            'Host': hostname,
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
-            'Accept-Language': 'en-US,en;q=0.9',
-            'Accept-Encoding': 'gzip, deflate, br',
-            'Connection': 'keep-alive',
-            'Upgrade-Insecure-Requests': '1',
-            'Sec-Fetch-Dest': 'document',
-            'Sec-Fetch-Mode': 'navigate',
-            'Sec-Fetch-Site': 'none',
-            'Sec-Fetch-User': '?1',
-            'Cache-Control': 'no-cache',
-            'Pragma': 'no-cache',
-        };
-
         const response = await fetch(url, {
-            method: 'GET',  // 改用 GET 方法
-            headers: headers,
-            redirect: 'follow',
-            cache: 'no-store',
-            credentials: 'omit',
+            method: 'GET',
+            headers: {
+                'Host': hostname,
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/122.0.0.0',
+                'Accept': '*/*',
+                'Accept-Language': 'en-US,en;q=0.9',
+                'Accept-Encoding': 'gzip, deflate',
+                'Connection': 'keep-alive'
+            }
         });
         
         if (!response.ok && response.status !== 101) {
