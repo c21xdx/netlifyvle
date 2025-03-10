@@ -3,8 +3,6 @@
   functions = "netlify/functions"
   publish = "public"
 
-[[redirects]]
-  from = "/*"
-  to = "/.netlify/functions/vless"
-  status = 200
-  force = true
+[[edge_functions]]
+  path = "/*"
+  function = "vless"
