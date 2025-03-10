@@ -219,13 +219,26 @@ async function handleVlessRequest(req: Request) {
 async function connect_remote(hostname: string, port: number, options: RequestInit = {}) {
     log('debug', `连接到远程服务器: ${hostname}:${port}`);
     try {
-        const url = `http://${hostname}:${port}`;
+        // 根据端口确定协议
+        const protocol = port === 443 ? 'https' : 'http';
+        const url = `${protocol}://${hostname}`;
+        
+        // 添加必要的请求头
+        const headers = new Headers(options.headers);
+        headers.set('User-Agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36');
+        headers.set('Accept', '*/*');
+        headers.set('Accept-Language', 'en-US,en;q=0.9');
+        
         const response = await fetch(url, {
             ...options,
+            headers,
             redirect: 'follow',
+            // 添加其他fetch选项
+            cache: 'no-store',
+            credentials: 'omit',
         });
         
-        if (!response.ok) {
+        if (!response.ok && response.status !== 101) { // 允许WebSocket升级
             throw new Error(`HTTP error! status: ${response.status}`);
         }
         
