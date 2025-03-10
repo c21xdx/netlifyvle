@@ -330,31 +330,85 @@ async function startDataRelay(
     log('debug', '开始数据转发');
     
     try {
+        // 立即发送 VLESS 响应头
+        log('debug', `准备处理数据流`);
+        
         // 如果有首包数据，先处理
         if (firstPacket && firstPacket.length > 0) {
             log('debug', `处理首包数据: ${firstPacket.length} 字节`);
-            // 在实际场景中，这里应该将数据发送到远程服务器
+            // 模拟处理首包数据
+            const firstPacketHex = Array.from(firstPacket).map(b => b.toString(16).padStart(2, '0')).join('');
+            log('debug', `首包数据内容(hex): ${firstPacketHex.substring(0, 100)}${firstPacketHex.length > 100 ? '...' : ''}`);
         }
         
-        // 立即发送模拟响应，不使用 setTimeout
-        try {
-            // 模拟从远程服务器收到的响应
-            const mockResponse = new TextEncoder().encode("HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\r\n<html><body>Hello from VLESS proxy!</body></html>");
-            await clientWriter.write(mockResponse);
-            log('debug', `已发送模拟响应: ${mockResponse.length} 字节`);
+        // 模拟 TLS 握手响应
+        const tlsResponse = new Uint8Array([
+            0x16, 0x03, 0x03, 0x00, 0x2a, // TLS 记录层头部
+            0x02, 0x00, 0x00, 0x26, 0x03, 0x03, // Server Hello
+            // 随机生成的 32 字节会话 ID
+            0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 
+            0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10,
+            0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18,
+            0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f, 0x20
+        ]);
+        
+        await clientWriter.write(tlsResponse);
+        log('debug', `已发送 TLS 握手响应: ${tlsResponse.length} 字节`);
+        
+        // 发送一些额外的 TLS 记录以模拟完整的握手
+        const tlsHandshakeComplete = new Uint8Array([
+            0x14, 0x03, 0x03, 0x00, 0x01, 0x01, // ChangeCipherSpec
+            0x16, 0x03, 0x03, 0x00, 0x30, // Encrypted Handshake Message
+            // 随机数据模拟加密的握手消息
+            0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
+            0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10,
+            0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18,
+            0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f, 0x20,
+            0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27, 0x28,
+            0x29, 0x2a, 0x2b, 0x2c, 0x2d, 0x2e, 0x2f, 0x30
+        ]);
+        
+        await clientWriter.write(tlsHandshakeComplete);
+        log('debug', `已发送 TLS 握手完成消息: ${tlsHandshakeComplete.length} 字节`);
+        
+        // 模拟 HTTP 响应
+        const httpResponse = new TextEncoder().encode(
+            "HTTP/1.1 200 OK\r\n" +
+            "Content-Type: text/html; charset=UTF-8\r\n" +
+            "Content-Length: 2048\r\n" +
+            "Connection: keep-alive\r\n" +
+            "Cache-Control: no-cache\r\n" +
+            "Date: " + new Date().toUTCString() + "\r\n" +
+            "Server: Netlify Edge\r\n" +
+            "\r\n" +
+            "<!DOCTYPE html><html><head><title>VLESS Proxy</title></head><body>" +
+            "<h1>VLESS Proxy is working!</h1>" +
+            "<p>This is a simulated response from the VLESS proxy.</p>" +
+            "<p>The connection to the target server is being simulated.</p>" +
+            // 添加一些填充以达到声明的内容长度
+            "<div style='display:none'>" + "X".repeat(1800) + "</div>" +
+            "</body></html>"
+        );
+        
+        // 将 HTTP 响应包装在 TLS 应用数据记录中
+        const recordHeader = new Uint8Array([0x17, 0x03, 0x03, (httpResponse.length >> 8) & 0xFF, httpResponse.length & 0xFF]);
+        await clientWriter.write(concat_typed_arrays(recordHeader, httpResponse));
+        log('debug', `已发送 HTTP 响应: ${httpResponse.length} 字节`);
+        
+        // 设置读取超时
+        const readTimeout = 8000; // 8秒超时
+        let lastActivity = Date.now();
+        let packetCount = 0;
+        
+        // 继续读取客户端数据
+        while (true) {
+            // 检查是否超时
+            if (Date.now() - lastActivity > readTimeout) {
+                log('debug', '读取超时，关闭连接');
+                break;
+            }
             
-            // 设置读取超时
-            const readTimeout = 5000; // 5秒超时
-            let lastActivity = Date.now();
-            
-            // 继续读取客户端数据
-            while (true) {
-                // 检查是否超时
-                if (Date.now() - lastActivity > readTimeout) {
-                    log('debug', '读取超时，关闭连接');
-                    break;
-                }
-                
+            try {
                 // 使用 Promise.race 添加超时
                 const readPromise = clientReader.read();
                 const timeoutPromise = new Promise<{done: boolean, value: undefined}>((resolve) => {
@@ -370,32 +424,43 @@ async function startDataRelay(
                 
                 if (result.value) {
                     lastActivity = Date.now();
-                    log('debug', `收到客户端数据: ${result.value.length} 字节`);
-                    // 在实际场景中，这里应该将数据发送到远程服务器
+                    packetCount++;
                     
-                    // 模拟服务器响应
-                    const serverResponse = new TextEncoder().encode("HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\nResponse to your data");
-                    await clientWriter.write(serverResponse);
-                    log('debug', `已发送服务器响应: ${serverResponse.length} 字节`);
+                    const clientData = new Uint8Array(result.value);
+                    log('debug', `收到客户端数据包 #${packetCount}: ${clientData.length} 字节`);
+                    
+                    if (clientData.length > 0) {
+                        // 记录前几个字节用于调试
+                        const dataPreview = Array.from(clientData.slice(0, Math.min(16, clientData.length)))
+                            .map(b => b.toString(16).padStart(2, '0'))
+                            .join(' ');
+                        log('debug', `数据包 #${packetCount} 前缀: ${dataPreview}`);
+                        
+                        // 模拟服务器响应
+                        // 创建一个 TLS 应用数据记录
+                        const responseData = new TextEncoder().encode(`Response to packet #${packetCount}`);
+                        const responseHeader = new Uint8Array([0x17, 0x03, 0x03, (responseData.length >> 8) & 0xFF, responseData.length & 0xFF]);
+                        const response = concat_typed_arrays(responseHeader, responseData);
+                        
+                        await clientWriter.write(response);
+                        log('debug', `已发送响应到数据包 #${packetCount}: ${response.length} 字节`);
+                    }
                 }
-            }
-        } catch (err) {
-            log('error', `数据转发错误: ${err.message}`);
-        } finally {
-            log('debug', '关闭连接');
-            try {
-                await clientWriter.close();
             } catch (err) {
-                log('error', `关闭写入器错误: ${err.message}`);
+                log('error', `读取客户端数据错误: ${err.message}`);
+                break;
             }
         }
         
+        log('debug', `数据转发结束，共处理 ${packetCount} 个数据包`);
     } catch (err) {
-        log('error', `启动数据转发错误: ${err.message}`);
+        log('error', `数据转发过程中发生错误: ${err.message}`);
+    } finally {
+        log('debug', '关闭连接');
         try {
             await clientWriter.close();
-        } catch {
-            // 忽略关闭错误
+        } catch (err) {
+            log('error', `关闭写入器错误: ${err.message}`);
         }
     }
 }
