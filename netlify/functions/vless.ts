@@ -177,49 +177,73 @@ async function handleVlessRequest(req: Request) {
             throw new Error('请求体为空');
         }
 
-        // 解析 VLESS 头部
         const vless = await read_vless_header(reader, SETTINGS.UUID);
         log('debug', `VLESS解析结果: 版本=${vless.version}, 目标=${vless.hostname}:${vless.port}`);
 
-        // 创建数据转换流来处理 VLESS 响应头
-        const transformStream = new TransformStream({
-            async start(controller) {
-                controller.enqueue(vless.resp);
-            }
-        });
+        // 创建用于发送到目标服务器的数据流
+        const { readable, writable } = new TransformStream();
+        const writer = writable.getWriter();
 
-        // 构建目标URL
+        // 发送初始数据
+        if (vless.data.length > 0) {
+            await writer.write(vless.data);
+        }
+
+        // 处理剩余数据流
+        (async () => {
+            try {
+                while (true) {
+                    const { done, value } = await reader.read();
+                    if (done) break;
+                    await writer.write(value);
+                }
+            } catch (error) {
+                log('error', '处理数据流时出错:', error);
+            } finally {
+                writer.close().catch(() => {});
+            }
+        })();
+
+        // 准备请求目标服务器
         const protocol = vless.port === 443 ? 'https' : 'http';
         const targetUrl = `${protocol}://${vless.hostname}`;
         log('debug', `正在连接到目标服务器: ${targetUrl}`);
 
-        // 创建到目标服务器的请求
-        try {
-            const response = await fetch(targetUrl, {
-                method: req.method,
-                headers: {
-                    'Host': vless.hostname,
-                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
-                    'Accept': '*/*',
-                    'Accept-Language': 'en-US,en;q=0.9',
-                },
-                body: req.body,
-                duplex: 'half',
-            });
+        // 发送请求到目标服务器
+        const response = await fetch(targetUrl, {
+            method: 'POST',
+            headers: {
+                'Host': vless.hostname,
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
+                'Accept': '*/*',
+                'Accept-Language': 'en-US,en;q=0.9',
+                'Connection': 'keep-alive'
+            },
+            body: readable,
+            duplex: 'half',
+        });
 
-            // 返回处理后的响应
-            return new Response(response.body?.pipeThrough(transformStream), {
-                headers: {
-                    'Content-Type': 'application/octet-stream',
-                    'Connection': 'keep-alive',
-                    'Cache-Control': 'no-store',
-                },
-            });
+        // 创建响应转换流
+        const { readable: processedReadable, writable: processedWritable } = new TransformStream({
+            start(controller) {
+                controller.enqueue(vless.resp);
+            }
+        });
 
-        } catch (error) {
-            log('error', '连接目标服务器失败:', error);
-            throw error;
+        // 转发响应数据
+        if (response.body) {
+            response.body.pipeTo(processedWritable).catch(error => {
+                log('error', '转发响应数据时出错:', error);
+            });
         }
+
+        return new Response(processedReadable, {
+            headers: {
+                'Content-Type': 'application/octet-stream',
+                'Connection': 'keep-alive',
+                'Cache-Control': 'no-store',
+            }
+        });
 
     } catch (err) {
         log('error', `处理VLESS请求失败: ${err.message}`);
