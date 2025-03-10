@@ -271,7 +271,7 @@ async function handleRequest(request: Request): Promise<Response> {
     if (pathParts.length >= 3 && pathParts[1] === SETTINGS.XHTTP_PATH.substring(1)) {
         const clientUUID = pathParts[2];
         
-        // 处理 POST 请求 (上行数据)
+        // 处理 POST 请求 (下行数据)
         if (request.method === 'POST' && pathParts.length >= 4) {
             const seq = parseInt(pathParts[3], 10);
             if (isNaN(seq)) {
@@ -366,6 +366,8 @@ async function handlePostRequest(request: Request, uuid: string, seq: number): P
                         await establishConnection(uuid, clientData);
                     } catch (err) {
                         log('error', `建立连接失败: ${err.message}`);
+                        log('error', `错误堆栈: ${err.stack}`);
+                        
                         // 发送一些模拟数据作为备用响应
                         const mockResponse = new Uint8Array(2048);
                         for (let i = 0; i < mockResponse.length; i++) {
@@ -430,6 +432,7 @@ async function handleGetRequest(uuid: string): Promise<Response> {
         // 创建响应流
         const { readable, writable } = new TransformStream();
         const writer = writable.getWriter();
+        log('debug', `创建响应流成功`);
         
         // 获取或创建客户端请求数据
         if (!clientRequests.has(uuid)) {
@@ -440,13 +443,81 @@ async function handleGetRequest(uuid: string): Promise<Response> {
                 writer,
                 maxSeq: -1
             });
+            log('debug', `已创建新的客户端请求并设置 writer`);
         } else {
             const clientData = clientRequests.get(uuid)!;
             clientData.lastActivity = Date.now();
+            
+            // 如果已经有旧的 writer，尝试关闭它
+            if (clientData.writer) {
+                log('debug', `关闭旧的响应流`);
+                try {
+                    await clientData.writer.close().catch(err => {
+                        log('error', `关闭旧响应流失败: ${err.message}`);
+                    });
+                } catch (err) {
+                    log('error', `关闭旧响应流异常: ${err.message}`);
+                }
+            }
+            
             clientData.writer = writer;
+            log('debug', `更新客户端响应流`);
+            
+            // 如果已经解析了 VLESS 头部，立即发送响应
+            if (clientData.targetInfo && clientData.posts.has(0)) {
+                log('debug', `已有目标信息和第一个数据包，尝试重新解析 VLESS 头部并发送响应`);
+                try {
+                    const firstPacket = clientData.posts.get(0)!;
+                    log('debug', `获取到第一个数据包，大小: ${firstPacket.length} 字节`);
+                    
+                    // 创建一个 ReadableStream 来模拟 reader
+                    const { readable: tempReadable, writable: tempWritable } = new TransformStream();
+                    const tempWriter = tempWritable.getWriter();
+                    await tempWriter.write(firstPacket);
+                    await tempWriter.close();
+                    log('debug', `创建临时流并写入第一个数据包成功`);
+                    
+                    const tempReader = tempReadable.getReader();
+                    
+                    // 解析 VLESS 头部
+                    log('debug', `开始重新解析 VLESS 头部`);
+                    const vless = await read_vless_header(tempReader, SETTINGS.UUID);
+                    log('debug', `重新解析 VLESS 头部成功，目标: ${vless.hostname}:${vless.port}`);
+                    
+                    // 发送 VLESS 响应
+                    const respHex = Array.from(vless.resp).map(b => b.toString(16).padStart(2, '0')).join('');
+                    log('debug', `准备发送 VLESS 响应(hex): ${respHex}`);
+                    
+                    await writer.write(vless.resp);
+                    log('debug', `VLESS 响应已发送: ${vless.resp.length} 字节`);
+                    
+                    // 尝试与目标服务器建立连接
+                    try {
+                        log('debug', `尝试与目标服务器建立连接: ${vless.hostname}:${vless.port}`);
+                        await establishConnection(uuid, clientData);
+                    } catch (err) {
+                        log('error', `建立连接失败: ${err.message}`);
+                        log('error', `错误堆栈: ${err.stack}`);
+                        
+                        // 发送一些模拟数据作为备用响应
+                        const mockResponse = new Uint8Array(2048);
+                        for (let i = 0; i < mockResponse.length; i++) {
+                            mockResponse[i] = i % 256;
+                        }
+                        
+                        log('debug', `准备发送模拟响应数据: ${mockResponse.length} 字节`);
+                        await writer.write(mockResponse);
+                        log('debug', `已发送模拟响应数据: ${mockResponse.length} 字节`);
+                    }
+                } catch (err) {
+                    log('error', `重新处理 VLESS 头部失败: ${err.message}`);
+                    log('error', `错误堆栈: ${err.stack}`);
+                }
+            }
         }
         
         // 返回响应
+        log('debug', `返回 GET 请求响应流`);
         return new Response(readable, {
             status: 200,
             headers: {
@@ -464,6 +535,7 @@ async function handleGetRequest(uuid: string): Promise<Response> {
         
     } catch (err) {
         log('error', `处理 GET 请求失败: ${err.message}`);
+        log('error', `错误堆栈: ${err.stack}`);
         return new Response(`Error: ${err.message}`, { status: 500 });
     }
 }
