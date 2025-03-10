@@ -177,37 +177,37 @@ async function handleVlessRequest(req: Request) {
             throw new Error('请求体为空');
         }
 
-        log('debug', '开始解析VLESS头部');
         const vless = await read_vless_header(reader, SETTINGS.UUID);
         log('debug', `VLESS解析结果: 版本=${vless.version}, 目标=${vless.hostname}:${vless.port}`);
 
-        try {
-            log('debug', '尝试建立远程连接');
-            const remote = await connect_remote(vless.hostname, vless.port);
-            log('info', `远程连接已建立: ${vless.hostname}:${vless.port}`);
+        // 建立到目标服务器的连接
+        const remoteResponse = await connect_remote(vless.hostname, vless.port, {
+            method: 'POST',
+            body: vless.data, // 发送剩余数据
+            headers: {
+                'Host': vless.hostname,
+                'Connection': 'keep-alive'
+            }
+        });
 
-            // 创建响应流
-            const { readable, writable } = new TransformStream();
-            const writer = writable.getWriter();
+        // 构造响应
+        const headers = new Headers(remoteResponse.headers);
+        headers.set('Content-Type', 'application/octet-stream');
 
-            // 写入VLESS响应头
-            log('debug', '写入VLESS响应头');
-            writer.write(vless.resp);
+        // 创建最终响应流
+        const { readable, writable } = new TransformStream();
+        const writer = writable.getWriter();
 
-            // 设置响应头
-            const headers = new Headers();
-            headers.set('Content-Type', 'application/octet-stream');
-            
-            log('info', '开始双向数据转发');
-            return new Response(readable, {
-                status: 200,
-                headers: headers,
-            });
+        // 写入VLESS响应头
+        writer.write(vless.resp);
+        
+        // 转发远程响应数据
+        remoteResponse.body?.pipeTo(writable);
 
-        } catch (err) {
-            log('error', `远程连接失败: ${err.message}`);
-            throw err;
-        }
+        return new Response(readable, {
+            status: 200,
+            headers: headers
+        });
 
     } catch (err) {
         log('error', `处理VLESS请求失败: ${err.message}`);
@@ -216,12 +216,21 @@ async function handleVlessRequest(req: Request) {
 }
 
 // 修改connect_remote函数
-async function connect_remote(hostname: string, port: number) {
-    log('debug', `尝试连接到远程服务器: ${hostname}:${port}`);
+async function connect_remote(hostname: string, port: number, options: RequestInit = {}) {
+    log('debug', `连接到远程服务器: ${hostname}:${port}`);
     try {
-        const conn = await fetch(`https://${hostname}:${port}`);
-        log('debug', `远程连接成功: ${conn.status} ${conn.statusText}`);
-        return conn;
+        const url = `http://${hostname}:${port}`;
+        const response = await fetch(url, {
+            ...options,
+            redirect: 'follow',
+        });
+        
+        if (!response.ok) {
+            throw new Error(`HTTP error! status: ${response.status}`);
+        }
+        
+        log('debug', `远程连接成功: ${response.status}`);
+        return response;
     } catch (err) {
         log('error', `远程连接失败: ${err.message}`);
         throw err;
