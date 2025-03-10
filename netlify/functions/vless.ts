@@ -450,3 +450,148 @@ function generatePadding(min: number, max: number): string {
     const length = Math.floor(Math.random() * (max - min + 1)) + min;
     return 'X'.repeat(length);
 }
+
+// 处理 VLESS 请求 (兼容旧模式)
+async function handleVlessRequest(request: Request): Promise<Response> {
+    log('debug', `开始处理 VLESS 请求`);
+    
+    try {
+        // 检查请求体
+        if (!request.body) {
+            log('error', `请求没有 body`);
+            throw new Error("No request body");
+        }
+        
+        const reader = request.body.getReader();
+        log('debug', `获取请求体读取器成功`);
+        
+        try {
+            // 尝试解析 VLESS 头部
+            log('debug', `开始解析 VLESS 头部`);
+            const vless = await read_vless_header(reader, SETTINGS.UUID);
+            log('info', `VLESS 头部解析成功，目标: ${vless.hostname}:${vless.port}`);
+            
+            // 创建响应流
+            const { readable, writable } = new TransformStream();
+            log('debug', `创建响应流成功`);
+            
+            // 发送 VLESS 响应
+            const writer = writable.getWriter();
+            await writer.write(vless.resp);
+            log('debug', `VLESS 响应已发送`);
+            
+            // 启动数据转发
+            startDataRelay(reader, writer, vless.data);
+            
+            // 返回响应
+            log('debug', `返回 VLESS 响应流`);
+            return new Response(readable, {
+                status: 200,
+                headers: {
+                    'Content-Type': 'application/octet-stream',
+                    'X-Request-Id': Math.random().toString(36).substring(2),
+                    'Connection': 'keep-alive',
+                    'Cache-Control': 'no-store, no-cache, must-revalidate',
+                    'Pragma': 'no-cache',
+                    'Expires': '0',
+                    'Access-Control-Allow-Origin': '*',
+                    'Access-Control-Allow-Methods': 'GET, POST',
+                    'X-Padding': generatePadding(100, 1000)
+                }
+            });
+        } catch (err) {
+            log('error', `解析 VLESS 头部错误: ${err.message}`);
+            reader.releaseLock();
+            throw err;
+        }
+    } catch (err) {
+        log('error', `处理 VLESS 请求失败: ${err.message}`);
+        return new Response(`VLESS Error: ${err.message}`, { status: 400 });
+    }
+}
+
+// 模拟数据转发
+async function startDataRelay(
+    clientReader: ReadableStreamDefaultReader<Uint8Array>,
+    clientWriter: WritableStreamDefaultWriter<Uint8Array>,
+    firstPacket?: Uint8Array
+) {
+    log('debug', '开始数据转发');
+    
+    try {
+        // 如果有首包数据，先处理
+        if (firstPacket && firstPacket.length > 0) {
+            log('debug', `处理首包数据: ${firstPacket.length} 字节`);
+            const firstPacketHex = Array.from(firstPacket.slice(0, Math.min(32, firstPacket.length)))
+                .map(b => b.toString(16).padStart(2, '0'))
+                .join('');
+            log('debug', `首包数据前缀(hex): ${firstPacketHex}`);
+        }
+        
+        // 生成一个简单的响应数据
+        const responseSize = 4096; // 4KB 响应
+        const response = new Uint8Array(responseSize);
+        
+        // 填充一些模式数据
+        for (let i = 0; i < responseSize; i++) {
+            response[i] = i % 256;
+        }
+        
+        log('debug', `准备发送模拟响应: ${response.length} 字节`);
+        
+        // 分块发送响应，避免一次性发送过多数据
+        const chunkSize = 1024; // 每次发送 1KB
+        for (let offset = 0; offset < response.length; offset += chunkSize) {
+            const chunk = response.slice(offset, Math.min(offset + chunkSize, response.length));
+            await clientWriter.write(chunk);
+            log('debug', `已发送响应块: ${offset}-${offset + chunk.length} (${chunk.length} 字节)`);
+        }
+        
+        log('debug', `响应发送完成，总共 ${response.length} 字节`);
+        
+        // 尝试读取更多客户端数据，但设置超时
+        const readTimeout = 5000; // 5秒超时
+        const startTime = Date.now();
+        
+        while (Date.now() - startTime < readTimeout) {
+            try {
+                // 使用 Promise.race 添加超时
+                const readPromise = clientReader.read();
+                const timeoutPromise = new Promise<{done: boolean, value: undefined}>((resolve) => {
+                    setTimeout(() => resolve({done: false, value: undefined}), 1000);
+                });
+                
+                const result = await Promise.race([readPromise, timeoutPromise]);
+                
+                if (result.done) {
+                    log('debug', '客户端已关闭连接');
+                    break;
+                }
+                
+                if (result.value) {
+                    const clientData = new Uint8Array(result.value);
+                    log('debug', `收到客户端数据: ${clientData.length} 字节`);
+                    
+                    // 发送一个简单的响应
+                    const ackResponse = new Uint8Array([0x41, 0x43, 0x4B]); // "ACK" in ASCII
+                    await clientWriter.write(ackResponse);
+                    log('debug', `已发送确认响应: ${ackResponse.length} 字节`);
+                }
+            } catch (err) {
+                log('error', `读取客户端数据错误: ${err.message}`);
+                break;
+            }
+        }
+        
+        log('debug', '关闭连接');
+        await clientWriter.close();
+        
+    } catch (err) {
+        log('error', `数据转发过程中发生错误: ${err.message}`);
+        try {
+            await clientWriter.close();
+        } catch {
+            // 忽略关闭错误
+        }
+    }
+}
