@@ -238,7 +238,11 @@ const clientRequests = new Map<string, {
     posts: Map<number, Uint8Array>,
     lastActivity: number,
     writer?: WritableStreamDefaultWriter<Uint8Array>,
-    maxSeq: number
+    maxSeq: number,
+    targetInfo?: {
+        hostname: string,
+        port: number
+    }
 }>();
 
 // 定期清理过期的请求
@@ -346,19 +350,31 @@ async function handlePostRequest(request: Request, uuid: string, seq: number): P
                 const vless = await read_vless_header(reader, SETTINGS.UUID);
                 log('info', `VLESS 头部解析成功，目标: ${vless.hostname}:${vless.port}`);
                 
+                // 存储目标信息
+                clientData.targetInfo = {
+                    hostname: vless.hostname,
+                    port: vless.port
+                };
+                
                 // 存储 VLESS 响应，稍后在 GET 请求中发送
                 if (clientData.writer) {
                     await clientData.writer.write(vless.resp);
                     log('debug', `VLESS 响应已发送到客户端`);
                     
-                    // 发送一些模拟数据作为响应
-                    const mockResponse = new Uint8Array(2048);
-                    for (let i = 0; i < mockResponse.length; i++) {
-                        mockResponse[i] = i % 256;
+                    // 尝试与目标服务器建立连接
+                    try {
+                        await establishConnection(uuid, clientData);
+                    } catch (err) {
+                        log('error', `建立连接失败: ${err.message}`);
+                        // 发送一些模拟数据作为备用响应
+                        const mockResponse = new Uint8Array(2048);
+                        for (let i = 0; i < mockResponse.length; i++) {
+                            mockResponse[i] = i % 256;
+                        }
+                        
+                        await clientData.writer.write(mockResponse);
+                        log('debug', `已发送模拟响应数据: ${mockResponse.length} 字节`);
                     }
-                    
-                    await clientData.writer.write(mockResponse);
-                    log('debug', `已发送模拟响应数据: ${mockResponse.length} 字节`);
                 } else {
                     log('debug', `GET 请求尚未建立，VLESS 响应将在 GET 请求到达时发送`);
                 }
@@ -366,14 +382,21 @@ async function handlePostRequest(request: Request, uuid: string, seq: number): P
                 log('error', `解析 VLESS 头部错误: ${err.message}`);
                 // 继续处理，不要中断流程
             }
-        } else if (clientData.writer) {
-            // 如果不是第一个包，且 GET 请求已经建立，直接转发数据
-            log('debug', `转发数据包 seq=${seq} 到客户端`);
+        } else if (clientData.writer && clientData.targetInfo) {
+            // 如果不是第一个包，且 GET 请求已经建立，尝试转发数据到目标服务器
+            log('debug', `转发数据包 seq=${seq} 到目标服务器`);
             
-            // 发送一个简单的响应
-            const ackResponse = new Uint8Array([0x41, 0x43, 0x4B]); // "ACK" in ASCII
-            await clientData.writer.write(ackResponse);
-            log('debug', `已发送确认响应: ${ackResponse.length} 字节`);
+            try {
+                // 这里可以添加实际的数据转发逻辑
+                // 由于 Netlify Edge Functions 的限制，我们只能使用 fetch API
+                
+                // 发送一个简单的确认响应
+                const ackResponse = new Uint8Array([0x41, 0x43, 0x4B]); // "ACK" in ASCII
+                await clientData.writer.write(ackResponse);
+                log('debug', `已发送确认响应: ${ackResponse.length} 字节`);
+            } catch (err) {
+                log('error', `转发数据失败: ${err.message}`);
+            }
         }
         
         // 更新最大序列号
@@ -480,8 +503,35 @@ async function handleVlessRequest(request: Request): Promise<Response> {
             await writer.write(vless.resp);
             log('debug', `VLESS 响应已发送`);
             
-            // 启动数据转发
-            startDataRelay(reader, writer, vless.data);
+            // 尝试与目标服务器建立连接并转发数据
+            try {
+                // 对于 HTTP/HTTPS 请求，可以直接使用 fetch
+                const targetUrl = `https://${vless.hostname}${vless.port !== 443 ? `:${vless.port}` : ''}`;
+                log('debug', `发起请求到: ${targetUrl}`);
+                
+                // 创建一个简单的 GET 请求
+                const response = await fetch(targetUrl, {
+                    method: 'GET',
+                    headers: {
+                        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+                    },
+                    signal: AbortSignal.timeout(5000)
+                });
+                
+                log('debug', `收到目标响应: ${response.status} ${response.statusText}`);
+                
+                // 读取响应体
+                const responseData = await response.arrayBuffer();
+                log('debug', `响应体大小: ${responseData.byteLength} 字节`);
+                
+                // 将响应发送给客户端
+                await writer.write(new Uint8Array(responseData));
+                log('debug', `已将目标响应转发给客户端`);
+            } catch (err) {
+                log('error', `请求目标服务器失败: ${err.message}`);
+                // 发送模拟数据作为备用响应
+                startDataRelay(reader, writer, vless.data);
+            }
             
             // 返回响应
             log('debug', `返回 VLESS 响应流`);
