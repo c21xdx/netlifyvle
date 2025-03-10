@@ -184,31 +184,29 @@ async function handleVlessRequest(req: Request) {
         const { readable, writable } = new TransformStream();
         const writer = writable.getWriter();
 
-        // 先写入之前解析出的数据
+        // 写入初始数据并处理后续数据流
         if (vless.data.length > 0) {
-            writer.write(vless.data);
+            await writer.write(vless.data);
         }
 
-        // 转发剩余的请求数据
+        // 处理后续数据流
         (async () => {
             try {
                 while (true) {
                     const { done, value } = await reader.read();
-                    if (done) {
-                        break;
-                    }
+                    if (done) break;
                     await writer.write(value);
                 }
-            } catch (e) {
-                log('error', '转发请求数据失败:', e);
             } finally {
-                writer.close();
+                writer.close().catch(console.error);
             }
         })();
 
         // 发送请求到目标服务器
-        const remoteResponse = await fetch(`https://${vless.hostname}`, {
+        const protocol = vless.port === 443 ? 'https' : 'http';
+        const remoteResponse = await fetch(`${protocol}://${vless.hostname}`, {
             method: 'POST',
+            duplex: 'half',  // 添加 duplex 选项
             headers: {
                 'Host': vless.hostname,
                 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/122.0.0.0',
@@ -217,29 +215,25 @@ async function handleVlessRequest(req: Request) {
             body: readable
         });
 
-        // 创建响应流
+        // 创建响应转换流
         const { readable: processedReadable, writable: processedWritable } = new TransformStream();
         const responseWriter = processedWritable.getWriter();
 
-        // 写入VLESS响应头
+        // 写入 VLESS 响应头
         await responseWriter.write(vless.resp);
 
         // 转发响应数据
         if (remoteResponse.body) {
-            const responseReader = remoteResponse.body.getReader();
             (async () => {
+                const reader = remoteResponse.body.getReader();
                 try {
                     while (true) {
-                        const { done, value } = await responseReader.read();
-                        if (done) {
-                            break;
-                        }
+                        const { done, value } = await reader.read();
+                        if (done) break;
                         await responseWriter.write(value);
                     }
-                } catch (e) {
-                    log('error', '转发响应数据失败:', e);
                 } finally {
-                    responseWriter.close();
+                    responseWriter.close().catch(console.error);
                 }
             })();
         }
@@ -248,7 +242,8 @@ async function handleVlessRequest(req: Request) {
             status: 200,
             headers: {
                 'Content-Type': 'application/octet-stream',
-                'Connection': 'keep-alive'
+                'Connection': 'keep-alive',
+                'Cache-Control': 'no-store'
             }
         });
 
