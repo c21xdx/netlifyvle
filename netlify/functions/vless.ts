@@ -3,9 +3,10 @@ import { Context } from "https://edge.netlify.com";
 // 核心配置
 const SETTINGS = {
     ['UUID']: '0cf85927-2c71-4e87-9df3-b1eb7d5a9e1b',
-    ['LOG_LEVEL']: 'info',
+    ['LOG_LEVEL']: 'debug',  // 改为debug级别以输出更多信息
     ['BUFFER_SIZE']: '128',
     ['XHTTP_PATH']: '/xblog',
+    ['LOG_DETAIL']: true,    // 是否输出详细日志
 } as const;
 
 // 定义日志级别
@@ -172,13 +173,62 @@ async function read_vless_header(reader: ReadableStreamDefaultReader<Uint8Array>
     };
 }
 
+// 添加handleVlessRequest函数的实现
+async function handleVlessRequest(req: Request) {
+    log('info', '开始处理VLESS请求');
+    try {
+        const reader = req.body?.getReader();
+        if (!reader) {
+            throw new Error('请求体为空');
+        }
+
+        log('debug', '开始解析VLESS头部');
+        const vless = await read_vless_header(reader, SETTINGS.UUID);
+        log('debug', `VLESS解析结果: 版本=${vless.version}, 目标=${vless.hostname}:${vless.port}`);
+
+        try {
+            log('debug', '尝试建立远程连接');
+            const remote = await connect_remote(vless.hostname, vless.port);
+            log('info', `远程连接已建立: ${vless.hostname}:${vless.port}`);
+
+            // 创建响应流
+            const { readable, writable } = new TransformStream();
+            const writer = writable.getWriter();
+
+            // 写入VLESS响应头
+            log('debug', '写入VLESS响应头');
+            writer.write(vless.resp);
+
+            // 设置响应头
+            const headers = new Headers();
+            headers.set('Content-Type', 'application/octet-stream');
+            
+            log('info', '开始双向数据转发');
+            return new Response(readable, {
+                status: 200,
+                headers: headers,
+            });
+
+        } catch (err) {
+            log('error', `远程连接失败: ${err.message}`);
+            throw err;
+        }
+
+    } catch (err) {
+        log('error', `处理VLESS请求失败: ${err.message}`);
+        return new Response(`Internal Server Error: ${err.message}`, { status: 500 });
+    }
+}
+
 // 修改connect_remote函数
 async function connect_remote(hostname: string, port: number) {
+    log('debug', `尝试连接到远程服务器: ${hostname}:${port}`);
     try {
         const conn = await fetch(`https://${hostname}:${port}`);
+        log('debug', `远程连接成功: ${conn.status} ${conn.statusText}`);
         return conn;
     } catch (err) {
-        log('error', `Connection failed: ${err.message}`);
+        log('error', `远程连接失败: ${err.message}`);
         throw err;
     }
 }
