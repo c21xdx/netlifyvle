@@ -180,39 +180,75 @@ async function handleVlessRequest(req: Request) {
         const vless = await read_vless_header(reader, SETTINGS.UUID);
         log('debug', `VLESS解析结果: 版本=${vless.version}, 目标=${vless.hostname}:${vless.port}`);
 
-        // 建立到目标服务器的连接
-        const remoteResponse = await connect_remote(vless.hostname, vless.port);
-        log('debug', '成功建立远程连接，开始数据传输');
+        // 创建到目标服务器的请求体
+        const { readable, writable } = new TransformStream();
+        const writer = writable.getWriter();
 
-        // 创建用于发送VLESS响应头的TransformStream
-        const vlessHeaderTransform = new TransformStream({
-            async start(controller) {
-                controller.enqueue(vless.resp);
-            }
-        });
-
-        // 创建主数据流的TransformStream
-        const dataTransform = new TransformStream({
-            async transform(chunk, controller) {
-                controller.enqueue(chunk);
-            }
-        });
-
-        // 串联转换流
-        let responseStream = remoteResponse.body;
-        if (responseStream) {
-            responseStream = responseStream
-                .pipeThrough(dataTransform)
-                .pipeThrough(vlessHeaderTransform);
+        // 先写入之前解析出的数据
+        if (vless.data.length > 0) {
+            writer.write(vless.data);
         }
 
-        // 返回响应
-        return new Response(responseStream, {
+        // 转发剩余的请求数据
+        (async () => {
+            try {
+                while (true) {
+                    const { done, value } = await reader.read();
+                    if (done) {
+                        break;
+                    }
+                    await writer.write(value);
+                }
+            } catch (e) {
+                log('error', '转发请求数据失败:', e);
+            } finally {
+                writer.close();
+            }
+        })();
+
+        // 发送请求到目标服务器
+        const remoteResponse = await fetch(`https://${vless.hostname}`, {
+            method: 'POST',
+            headers: {
+                'Host': vless.hostname,
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/122.0.0.0',
+                'Connection': 'keep-alive'
+            },
+            body: readable
+        });
+
+        // 创建响应流
+        const { readable: processedReadable, writable: processedWritable } = new TransformStream();
+        const responseWriter = processedWritable.getWriter();
+
+        // 写入VLESS响应头
+        await responseWriter.write(vless.resp);
+
+        // 转发响应数据
+        if (remoteResponse.body) {
+            const responseReader = remoteResponse.body.getReader();
+            (async () => {
+                try {
+                    while (true) {
+                        const { done, value } = await responseReader.read();
+                        if (done) {
+                            break;
+                        }
+                        await responseWriter.write(value);
+                    }
+                } catch (e) {
+                    log('error', '转发响应数据失败:', e);
+                } finally {
+                    responseWriter.close();
+                }
+            })();
+        }
+
+        return new Response(processedReadable, {
             status: 200,
             headers: {
                 'Content-Type': 'application/octet-stream',
-                'Connection': 'keep-alive',
-                'Cache-Control': 'no-store'
+                'Connection': 'keep-alive'
             }
         });
 
