@@ -18,15 +18,10 @@ const LOG_LEVELS = {
 } as const;
 
 // 工具函数
+// 修改log函数，确保始终输出关键日志
 function log(type: string, ...args: unknown[]) {
-    // 检查当前日志级别是否应该输出
-    const currentLevel = LOG_LEVELS[type as keyof typeof LOG_LEVELS] || 0;
-    const configLevel = LOG_LEVELS[SETTINGS.LOG_LEVEL as keyof typeof LOG_LEVELS] || 1;
-    
-    if (currentLevel >= configLevel) {
-        const time = new Date().toISOString();
-        console.log(`[${time}] [${type}]`, ...args);
-    }
+    const time = new Date().toISOString();
+    console.log(`[${time}] [${type}]`, ...args);
 }
 
 function validate_uuid(left: Uint8Array, right: Uint8Array): boolean {
@@ -235,11 +230,14 @@ async function connect_remote(hostname: string, port: number) {
 
 export default async function handler(req: Request, context: Context) {
     const url = new URL(req.url);
-    log('info', `Received ${req.method} request to ${url.pathname}`);
+    log('info', `收到请求: ${req.method} ${url.pathname}`);
 
-    if (req.method === 'POST' && url.pathname.includes(SETTINGS.XHTTP_PATH)) {
+    // 修改路径匹配逻辑
+    if (req.method === 'POST' && url.pathname === SETTINGS.XHTTP_PATH) {
+        log('info', '匹配到VLESS请求路径');
         return await handleVlessRequest(req);
     }
 
+    log('info', '未匹配到VLESS路径，返回404');
     return new Response("Not Found", { status: 404 });
 }
