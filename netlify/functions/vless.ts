@@ -175,15 +175,18 @@ async function read_vless_header(reader: ReadableStreamDefaultReader<Uint8Array>
 // 在 connections 定义前添加远程连接和转发相关函数
 async function connect_remote(hostname: string, port: number) {
     try {
-        // 在 Edge Functions 中使用 fetch 建立 TCP 连接
+        // 使用 HTTPS 请求替代 CONNECT
         const resp = await fetch(`https://${hostname}:${port}`, {
-            method: 'CONNECT',
+            method: 'POST',
             headers: {
                 'Host': hostname,
-            }
+                'Connection': 'keep-alive'
+            },
+            // 设置流模式以支持大数据传输
+            duplex: 'half'
         });
         
-        if (!resp.ok) {
+        if (!resp.ok && resp.status !== 101) { // 101 是协议升级状态码
             throw new Error(`Failed to connect: ${resp.status}`);
         }
         
@@ -200,29 +203,32 @@ async function relay(
     firstPacket?: Uint8Array
 ) {
     try {
-        // 如果有首包数据，先发送
         if (firstPacket && firstPacket.length > 0) {
+            log('debug', `发送首包数据: ${firstPacket.length} 字节`);
             await responseWriter.write(firstPacket);
         }
 
-        // 创建远程到本地的转发
         const reader = remoteStream.getReader();
         try {
             while (true) {
                 const { value, done } = await reader.read();
-                if (done) break;
-                await responseWriter.write(value);
-            }
-        } catch (err) {
-            if (!err.message.includes('abort')) {
-                throw err;
+                if (done) {
+                    log('debug', '远程连接已关闭');
+                    break;
+                }
+                if (value) {
+                    log('debug', `转发数据: ${value.length} 字节`);
+                    await responseWriter.write(value);
+                }
             }
         } finally {
             reader.releaseLock();
         }
     } catch (err) {
-        log('error', '转发错误:', err);
-        throw err;
+        if (!err.message.includes('stream closed') && !err.message.includes('abort')) {
+            log('error', '转发错误:', err);
+            throw err;
+        }
     }
 }
 
@@ -333,6 +339,14 @@ export default async function handler(req: Request, context: Context) {
                         
                         conn.remoteConnection = remoteStream;
                         log('info', `远程连接建立成功`);
+                        
+                        // 发送初始数据
+                        const { writable, readable } = new TransformStream();
+                        const writer = writable.getWriter();
+                        await writer.write(conn.vlessHeader.data);
+                        writer.releaseLock();
+                        
+                        conn.stream = writable;
                     } finally {
                         reader.releaseLock();
                     }
