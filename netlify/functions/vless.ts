@@ -231,32 +231,42 @@ async function relay(
     firstPacket?: Uint8Array
 ) {
     try {
-        if (firstPacket && firstPacket.length > 0) {
-            log('debug', `发送首包数据: ${firstPacket.length} 字节`);
-            await responseWriter.write(firstPacket);
-        }
+        // 创建双向管道
+        const pipeGenerator = new TransformStream();
+        const pipeWriter = pipeGenerator.writable.getWriter();
 
-        const reader = remoteStream.getReader();
-        try {
-            while (true) {
-                const { value, done } = await reader.read();
-                if (done) {
-                    log('debug', '远程连接已关闭');
-                    break;
+        // 启动远程数据读取
+        const remoteReader = remoteStream.getReader();
+        
+        (async () => {
+            try {
+                while (true) {
+                    const { value, done } = await remoteReader.read();
+                    if (done) {
+                        log('debug', '远程连接已结束');
+                        break;
+                    }
+                    if (value) {
+                        log('debug', `接收远程数据: ${value.length} 字节`);
+                        await responseWriter.write(value);
+                    }
                 }
-                if (value) {
-                    log('debug', `转发数据: ${value.length} 字节`);
-                    await responseWriter.write(value);
+            } catch (e) {
+                log('error', '读取远程数据错误:', e);
+            } finally {
+                try {
+                    await responseWriter.close();
+                } catch (e) {
+                    // 忽略关闭错误
                 }
+                remoteReader.releaseLock();
             }
-        } finally {
-            reader.releaseLock();
-        }
+        })();
+
+        return pipeGenerator.readable;
     } catch (err) {
-        if (!err.message.includes('stream closed') && !err.message.includes('abort')) {
-            log('error', '转发错误:', err);
-            throw err;
-        }
+        log('error', '创建数据管道错误:', err);
+        throw err;
     }
 }
 
@@ -450,7 +460,6 @@ export default async function handler(req: Request, context: Context) {
         const { readable, writable } = new TransformStream();
         const writer = writable.getWriter();
 
-        log('debug', `开始处理下行数据流`);
         try {
             // 先发送 VLESS 响应
             if (conn.vlessHeader) {
@@ -473,9 +482,12 @@ export default async function handler(req: Request, context: Context) {
             if (conn.remoteConnection) {
                 log('debug', `开始数据转发`);
                 conn.stream = writable;
-                relay(conn.remoteConnection, writer).catch((e) => {
-                    log('error', '转发错误:', e);
-                    connections.delete(uuid);
+                
+                // 建立响应流
+                const responseStream = await relay(conn.remoteConnection, writer);
+                
+                return new Response(responseStream, {
+                    headers: responseHeaders
                 });
             }
 
