@@ -179,40 +179,50 @@ async function read_vless_header(reader: ReadableStreamDefaultReader<Uint8Array>
 
 // 在 connections 定义前添加远程连接和转发相关函数
 async function connect_remote(hostname: string, port: number) {
-    try {
-        const targetUrl = `https://${hostname}:${port}`;
-        log('debug', `尝试连接到目标服务器: ${targetUrl}`);
-        
-        const response = await fetch(targetUrl, {
-            method: 'CONNECT',  // 使用 CONNECT 方法
-            headers: {
-                'Host': hostname,
-                'Connection': 'keep-alive',
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
-                'Accept': '*/*'
-            },
-            redirect: 'follow',
-            duplex: 'half'
-        });
+    const methods = ['GET', 'POST', 'HEAD'];
+    let lastError: Error | null = null;
 
-        if (!response.ok && response.status !== 200) {
-            throw new Error(`远程连接失败: ${response.status}`);
+    for (const method of methods) {
+        try {
+            const targetUrl = `https://${hostname}:${port}`;
+            log('debug', `尝试使用 ${method} 连接到: ${targetUrl}`);
+            
+            const response = await fetch(targetUrl, {
+                method: method,
+                headers: {
+                    'Host': hostname,
+                    'Connection': 'keep-alive',
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
+                    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+                    'Accept-Language': 'en-US,en;q=0.9'
+                },
+                redirect: 'follow',
+                duplex: 'half'
+            });
+
+            // 任何响应都可以接受，因为我们只需要建立连接
+            const stream = response.body;
+            if (!stream) {
+                throw new Error('未获取到响应流');
+            }
+
+            log('debug', `成功建立连接，响应状态: ${response.status}`);
+            return {
+                stream,
+                response,
+                method
+            };
+        } catch (err) {
+            lastError = err as Error;
+            log('warn', `${method} 连接失败: ${err.message}`);
+            // 如果不是最后一个方法，继续尝试下一个
+            if (method !== methods[methods.length - 1]) {
+                continue;
+            }
         }
-
-        const stream = response.body;
-        if (!stream) {
-            throw new Error('未获取到响应流');
-        }
-
-        log('debug', `成功建立连接，响应状态: ${response.status}`);
-        return {
-            stream,
-            response
-        };
-    } catch (err) {
-        log('error', `连接远程服务器失败: ${err.message}`);
-        throw err;
     }
+
+    throw lastError || new Error('所有连接方法均失败');
 }
 
 async function relay(
