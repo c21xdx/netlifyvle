@@ -172,11 +172,6 @@ async function read_vless_header(reader: ReadableStreamDefaultReader<Uint8Array>
     };
 }
 
-// VLESS 协议解析函数
-async function read_vless_header(reader: ReadableStreamDefaultReader<Uint8Array>, cfg_uuid: string) {
-    // ... existing code from deno.ts for read_vless_header ...
-}
-
 // 连接管理
 const connections = new Map<string, {
     buffer: Map<number, Uint8Array>,
