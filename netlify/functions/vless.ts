@@ -193,20 +193,27 @@ async function connect_remote(hostname: string, port: number) {
                     'Host': hostname,
                     'Connection': 'keep-alive',
                     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
-                    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+                    'Accept': '*/*',
+                    'Accept-Encoding': 'gzip, deflate',
                     'Accept-Language': 'en-US,en;q=0.9'
                 },
                 redirect: 'follow',
                 duplex: 'half'
             });
 
-            // 任何响应都可以接受，因为我们只需要建立连接
+            // 详细记录响应信息
+            log('debug', `远程服务器响应:`, {
+                status: response.status,
+                statusText: response.statusText,
+                headers: Object.fromEntries(response.headers.entries())
+            });
+
             const stream = response.body;
             if (!stream) {
-                throw new Error('未获取到响应流');
+                throw new Error(`未获取到响应流 (状态码: ${response.status})`);
             }
 
-            log('debug', `成功建立连接，响应状态: ${response.status}`);
+            log('info', `远程连接成功建立: ${method} ${targetUrl} -> ${response.status}`);
             return {
                 stream,
                 response,
@@ -215,7 +222,6 @@ async function connect_remote(hostname: string, port: number) {
         } catch (err) {
             lastError = err as Error;
             log('warn', `${method} 连接失败: ${err.message}`);
-            // 如果不是最后一个方法，继续尝试下一个
             if (method !== methods[methods.length - 1]) {
                 continue;
             }
@@ -234,20 +240,22 @@ async function relay(
         const remoteStream = remoteResponse.stream;
         const remoteReader = remoteStream.getReader();
         
-        // 先写入首包数据（如果有）
+        // 记录开始转发的响应信息
+        log('debug', `开始数据转发，响应状态: ${remoteResponse.response.status}`);
+        
         if (firstPacket) {
+            log('debug', `写入首包数据: ${firstPacket.length} 字节`);
             await responseWriter.write(firstPacket);
         }
 
-        // 持续转发数据
         while (true) {
             const { value, done } = await remoteReader.read();
             if (done) {
-                log('debug', '远程连接已结束');
+                log('debug', '远程数据流结束');
                 break;
             }
             if (value) {
-                log('debug', `转发远程数据: ${value.length} 字节`);
+                log('debug', `收到远程数据: ${value.length} 字节`);
                 await responseWriter.write(value);
             }
         }
@@ -256,9 +264,10 @@ async function relay(
         throw err;
     } finally {
         try {
+            log('debug', '关闭响应写入器');
             await responseWriter.close();
         } catch (e) {
-            // 忽略关闭错误
+            log('warn', '关闭写入器时发生错误:', e);
         }
     }
 }
@@ -506,13 +515,18 @@ export default async function handler(req: Request, context: Context) {
             
             // 开始数据转发
             if (conn.remoteConnection) {
-                log('debug', `开始数据转发`);
+                log('debug', `开始数据转发，远程连接状态: ${conn.remoteConnection.response.status}`);
                 conn.stream = writable;
                 
-                // 建立响应流
-                const responseStream = await relay(conn.remoteConnection, writer);
+                try {
+                    await relay(conn.remoteConnection, writer);
+                    log('info', '数据转发完成');
+                } catch (e) {
+                    log('error', '数据转发失败:', e);
+                    throw e;
+                }
                 
-                return new Response(responseStream, {
+                return new Response(readable, {
                     headers: responseHeaders
                 });
             }
