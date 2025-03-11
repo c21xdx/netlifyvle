@@ -1,6 +1,5 @@
-// 使用 Node.js 内置模块
-import http from "http";
-import { Readable, Writable } from "stream";
+// 导入 Node.js 内置模块
+import { Readable } from "stream";
 
 // 核心配置
 const SETTINGS = {
@@ -30,44 +29,23 @@ function log(type: string, ...args: unknown[]) {
 
 // 其他工具函数保持不变...
 
-// 启动服务器
-async function startServer() {
-    try {
-        const port = parseInt(process.env.PORT || "3000");
-        log('info', `Server running on port ${port}`);
-
-        // 使用 Node.js 的 http 模块创建服务器
-        const server = http.createServer(async (req, res) => {
-            try {
-                const url = new URL(req.url || "", `http://${req.headers.host}`);
-                log('info', `Received ${req.method} request to ${url.pathname}`);
-                if (req.method === 'POST' && url.pathname.includes(SETTINGS.XHTTP_PATH)) {
-                    const response = await handleVlessRequest(req);
-                    res.writeHead(response.status, response.headers);
-                    response.body?.pipe(res); // 将响应流传递给客户端
-                } else {
-                    res.writeHead(404, { 'Content-Type': 'text/plain' });
-                    res.end("Not Found");
-                }
-            } catch (err) {
-                log('error', 'Failed to handle request:', err);
-                res.writeHead(500, { 'Content-Type': 'text/plain' });
-                res.end("Internal Server Error");
-            }
-        });
-
-        server.listen(port, () => {
-            log('info', `Server listening on port ${port}`);
-        });
-    } catch (err) {
-        log('error', 'Failed to start server:', err);
+// 请求处理函数
+async function handleRequest(request: Request): Promise<Response> {
+    const url = new URL(request.url);
+    log('info', `Received ${request.method} request to ${url.pathname}`);
+    if (request.method === 'POST' && url.pathname.includes(SETTINGS.XHTTP_PATH)) {
+        return await handleVlessRequest(request);
     }
+    return new Response("Not Found", { status: 404 });
 }
 
 // 处理 VLESS 请求
-async function handleVlessRequest(request: http.IncomingMessage): Promise<{ status: number; headers: Record<string, string>; body?: Readable }> {
+async function handleVlessRequest(request: Request): Promise<Response> {
     try {
-        const reader = request.pipe(new PassThrough()); // 将请求体转换为可读流
+        const reader = request.body?.getReader();
+        if (!reader) {
+            throw new Error("No request body");
+        }
         const vless = await read_vless_header(reader, SETTINGS.UUID);
         const remote = await connect_remote(vless.hostname, vless.port);
         const remoteStream = tcpToWebStream(remote);
@@ -75,55 +53,52 @@ async function handleVlessRequest(request: http.IncomingMessage): Promise<{ stat
         const { readable, writable } = new TransformStream();
         relay(reader, remoteStream, vless.data, readable, writable, vless.resp);
 
-        return {
+        return new Response(readable, {
             status: 200,
             headers: {
                 'Content-Type': 'application/grpc',
                 'X-Request-Id': Math.random().toString(36).substring(2),
                 'X-Response-Id': '1',
                 'X-Stream-Mode': 'one'
-            },
-            body: Readable.from(readable)
-        };
+            }
+        });
     } catch (err) {
         log('error', 'Failed to handle VLESS request:', err);
-        return {
-            status: 400,
-            headers: { 'Content-Type': 'text/plain' },
-            body: Readable.from(["Invalid Request"])
-        };
+        return new Response("Invalid Request", { status: 400 });
     }
 }
 
-// 网络相关函数
-async function connect_remote(hostname: string, port: number): Promise<any> {
-    return new Promise((resolve, reject) => {
-        const socket = require('net').connect({ host: hostname, port }, () => {
-            resolve(socket);
+// Netlify 的 handler 函数
+export async function handler(event: any, context: any): Promise<Response> {
+    try {
+        // 构造 Request 对象
+        const request = new Request(event.rawUrl, {
+            method: event.httpMethod,
+            headers: new Headers(event.headers),
+            body: event.body ? Buffer.from(event.body, 'base64') : null,
         });
-        socket.on('error', reject);
-    });
-}
 
-function tcpToWebStream(conn: any) {
-    return {
-        readable: new Readable({
-            read() {
-                conn.on('data', (chunk: Buffer) => this.push(chunk));
-                conn.on('end', () => this.push(null));
-                conn.on('error', (err: Error) => this.destroy(err));
-            }
-        }),
-        writable: new Writable({
-            write(chunk: Buffer, _encoding, callback) {
-                conn.write(chunk, callback);
-            },
-            final(callback) {
-                conn.end(callback);
-            }
-        })
-    };
-}
+        // 调用现有的请求处理逻辑
+        const response = await handleRequest(request);
 
-// 启动服务器
-startServer();
+        // 构造 Netlify 的响应格式
+        const headers: Record<string, string> = {};
+        response.headers.forEach((value, key) => {
+            headers[key] = value;
+        });
+
+        return {
+            statusCode: response.status,
+            headers,
+            body: response.body ? Buffer.from(await response.arrayBuffer()).toString('base64') : '',
+            isBase64Encoded: true,
+        };
+    } catch (err) {
+        log('error', 'Handler error:', err);
+        return {
+            statusCode: 500,
+            headers: { 'Content-Type': 'text/plain' },
+            body: 'Internal Server Error',
+        };
+    }
+}
