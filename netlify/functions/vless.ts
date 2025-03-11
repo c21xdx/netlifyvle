@@ -270,31 +270,58 @@ async function relay(
     }
 }
 
-// 连接管理
+// 修改连接管理接口
 const connections = new Map<string, {
     buffer: Map<number, Uint8Array>,
     stream: WritableStream | null,
     vlessHeader: any | null,
     remoteConnection: any | null,
-    lastActive: number
+    lastActive: number,
+    isEstablished: boolean,  // 新增：标记连接是否完全建立
+    expectedSeq: number      // 新增：期望的下一个序列号
 }>();
 
-// 清理超时连接
+// 更新清理超时连接的逻辑
 setInterval(() => {
     const now = Date.now();
     for (const [uuid, conn] of connections) {
-        if (now - conn.lastActive > 30000) {
+        if (now - conn.lastActive > 30000 || 
+            (now - conn.lastActive > 10000 && !conn.isEstablished)) {
+            log('info', `清理超时连接: UUID=${uuid}, isEstablished=${conn.isEstablished}`);
             if (conn.remoteConnection) {
                 try {
-                    conn.remoteConnection.close();
+                    conn.remoteConnection.cancel();
                 } catch (e) {
-                    // ignore
+                    log('warn', `关闭远程连接失败:`, e);
+                }
+            }
+            if (conn.stream) {
+                try {
+                    const writer = conn.stream.getWriter();
+                    writer.close().catch(() => {});
+                } catch (e) {
+                    log('warn', `关闭流失败:`, e);
                 }
             }
             connections.delete(uuid);
         }
     }
 }, 5000);
+
+// 修改连接初始化逻辑
+function initConnection(uuid: string) {
+    const conn = {
+        buffer: new Map(),
+        stream: null,
+        vlessHeader: null,
+        remoteConnection: null,
+        lastActive: Date.now(),
+        isEstablished: false,
+        expectedSeq: 0
+    };
+    connections.set(uuid, conn);
+    return conn;
+}
 
 export default async function handler(req: Request, context: Context) {
     // 验证 padding
@@ -360,15 +387,19 @@ export default async function handler(req: Request, context: Context) {
 
         let conn = connections.get(uuid);
         if (!conn) {
-            log('info', `创建新连接: UUID=${uuid}`);
-            conn = {
-                buffer: new Map(),
-                stream: null,
-                vlessHeader: null,
-                remoteConnection: null,
-                lastActive: Date.now()
-            };
-            connections.set(uuid, conn);
+            conn = initConnection(uuid);
+        }
+        
+        // 验证序列号
+        if (seqNum !== conn.expectedSeq) {
+            log('warn', `序列号不匹配: 期望=${conn.expectedSeq}, 实际=${seqNum}`);
+            if (seqNum < conn.expectedSeq) {
+                // 忽略重复的包
+                return new Response(null, { headers });
+            }
+            // 序列号跳跃，终止连接
+            connections.delete(uuid);
+            return new Response('Bad Request', { status: 400 });
         }
 
         // 检查缓存数量限制
@@ -425,8 +456,10 @@ export default async function handler(req: Request, context: Context) {
                     connections.delete(uuid);
                     return new Response('Bad Request', { status: 400 });
                 }
+                conn.isEstablished = true;
             }
 
+            conn.expectedSeq++;
             conn.buffer.set(seqNum, data);
             conn.lastActive = Date.now();
             log('debug', `数据包已缓存: SEQ=${seqNum}`);
@@ -443,8 +476,8 @@ export default async function handler(req: Request, context: Context) {
     if (req.method === 'GET') {
         log('debug', `处理 GET 请求: UUID=${uuid}`);
         const conn = connections.get(uuid);
-        if (!conn) {
-            log('warn', `未找到连接: UUID=${uuid}`);
+        if (!conn || !conn.isEstablished) {
+            log('warn', `无效的下行请求: UUID=${uuid}, isEstablished=${conn?.isEstablished}`);
             return new Response('Not Found', { status: 404 });
         }
 
