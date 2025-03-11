@@ -6,6 +6,11 @@ const SETTINGS = {
     BUFFER_SIZE: 16384,
     XHTTP_PATH: '/xblog',
     LOG_LEVEL: 'debug',  // 设置日志级别为 debug
+    // 添加 packet-up 模式的配置
+    SC_MAX_EACH_POST_BYTES: 1000000,  // 1MB
+    SC_MAX_BUFFERED_POSTS: 30,
+    MIN_PADDING_LEN: 100,
+    MAX_PADDING_LEN: 1000
 } as const;
 
 // 定义日志级别
@@ -282,6 +287,21 @@ setInterval(() => {
 }, 5000);
 
 export default async function handler(req: Request, context: Context) {
+    // 验证 padding
+    const referer = req.headers.get('Referer');
+    if (!referer?.includes('x_padding=')) {
+        log('warn', '请求缺少必要的 padding');
+        return new Response('Bad Request', { status: 400 });
+    }
+
+    const padMatch = referer.match(/x_padding=([X]+)/);
+    if (!padMatch || 
+        padMatch[1].length < SETTINGS.MIN_PADDING_LEN || 
+        padMatch[1].length > SETTINGS.MAX_PADDING_LEN) {
+        log('warn', 'padding 长度不符合要求');
+        return new Response('Bad Request', { status: 400 });
+    }
+
     const url = new URL(req.url);
     log('debug', `收到请求: ${req.method} ${url.pathname}`);
     
@@ -306,7 +326,10 @@ export default async function handler(req: Request, context: Context) {
     const headers = {
         'Access-Control-Allow-Origin': '*',
         'Access-Control-Allow-Methods': 'GET, POST',
-        'X-Padding': 'X'.repeat(100 + Math.floor(Math.random() * 900))
+        'X-Padding': 'X'.repeat(
+            SETTINGS.MIN_PADDING_LEN + 
+            Math.floor(Math.random() * (SETTINGS.MAX_PADDING_LEN - SETTINGS.MIN_PADDING_LEN))
+        )
     };
 
     // POST 请求处理(上行数据)
@@ -316,6 +339,13 @@ export default async function handler(req: Request, context: Context) {
         if (isNaN(seqNum)) {
             log('warn', `无效的 SEQ 数值: ${seq}`);
             return new Response('Bad Request', { status: 400 });
+        }
+
+        // 检查 POST 大小限制
+        const contentLength = parseInt(req.headers.get('content-length') || '0');
+        if (contentLength > SETTINGS.SC_MAX_EACH_POST_BYTES) {
+            log('warn', `POST 数据超过大小限制: ${contentLength}`);
+            return new Response('Payload Too Large', { status: 413 });
         }
 
         let conn = connections.get(uuid);
@@ -329,6 +359,13 @@ export default async function handler(req: Request, context: Context) {
                 lastActive: Date.now()
             };
             connections.set(uuid, conn);
+        }
+
+        // 检查缓存数量限制
+        if (conn.buffer.size >= SETTINGS.SC_MAX_BUFFERED_POSTS) {
+            log('warn', `缓存的 POST 请求数量超过限制: ${conn.buffer.size}`);
+            connections.delete(uuid);
+            return new Response('Too Many Requests', { status: 429 });
         }
 
         try {
@@ -405,7 +442,9 @@ export default async function handler(req: Request, context: Context) {
             ...headers,
             'Content-Type': 'text/event-stream',
             'Cache-Control': 'no-store',
-            'X-Accel-Buffering': 'no'
+            'X-Accel-Buffering': 'no',
+            'Connection': 'keep-alive',
+            'Transfer-Encoding': 'chunked'
         };
 
         const { readable, writable } = new TransformStream();
@@ -441,17 +480,18 @@ export default async function handler(req: Request, context: Context) {
             }
 
             return new Response(readable, {
-                headers: {
-                    ...responseHeaders,
-                    'Connection': 'keep-alive',
-                    'Transfer-Encoding': 'chunked'
-                }
+                headers: responseHeaders
             });
         } catch (e) {
             log('error', `处理下行数据错误:`, e);
             connections.delete(uuid);
             return new Response('Internal Server Error', { status: 500 });
         }
+    }
+
+    // 处理 OPTIONS 请求
+    if (req.method === 'OPTIONS') {
+        return new Response(null, { headers });
     }
 
     log('warn', `不支持的请求方法: ${req.method}`);
