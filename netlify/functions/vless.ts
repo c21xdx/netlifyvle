@@ -172,6 +172,60 @@ async function read_vless_header(reader: ReadableStreamDefaultReader<Uint8Array>
     };
 }
 
+// 在 connections 定义前添加远程连接和转发相关函数
+async function connect_remote(hostname: string, port: number) {
+    try {
+        // 在 Edge Functions 中使用 fetch 建立 TCP 连接
+        const resp = await fetch(`https://${hostname}:${port}`, {
+            method: 'CONNECT',
+            headers: {
+                'Host': hostname,
+            }
+        });
+        
+        if (!resp.ok) {
+            throw new Error(`Failed to connect: ${resp.status}`);
+        }
+        
+        return resp.body;
+    } catch (err) {
+        log('error', `连接失败: ${err.message}`);
+        throw err;
+    }
+}
+
+async function relay(
+    remoteStream: ReadableStream,
+    responseWriter: WritableStreamDefaultWriter<any>,
+    firstPacket?: Uint8Array
+) {
+    try {
+        // 如果有首包数据，先发送
+        if (firstPacket && firstPacket.length > 0) {
+            await responseWriter.write(firstPacket);
+        }
+
+        // 创建远程到本地的转发
+        const reader = remoteStream.getReader();
+        try {
+            while (true) {
+                const { value, done } = await reader.read();
+                if (done) break;
+                await responseWriter.write(value);
+            }
+        } catch (err) {
+            if (!err.message.includes('abort')) {
+                throw err;
+            }
+        } finally {
+            reader.releaseLock();
+        }
+    } catch (err) {
+        log('error', '转发错误:', err);
+        throw err;
+    }
+}
+
 // 连接管理
 const connections = new Map<string, {
     buffer: Map<number, Uint8Array>,
@@ -271,7 +325,14 @@ export default async function handler(req: Request, context: Context) {
                         conn.vlessHeader = await read_vless_header(reader, SETTINGS.UUID);
                         log('info', `成功解析 VLESS 头: ${conn.vlessHeader.hostname}:${conn.vlessHeader.port}`);
                         
-                        // ...existing remote connection code...
+                        log('debug', `尝试建立远程连接到 ${conn.vlessHeader.hostname}:${conn.vlessHeader.port}`);
+                        const remoteStream = await connect_remote(conn.vlessHeader.hostname, conn.vlessHeader.port);
+                        if (!remoteStream) {
+                            throw new Error('Failed to establish remote connection');
+                        }
+                        
+                        conn.remoteConnection = remoteStream;
+                        log('info', `远程连接建立成功`);
                     } finally {
                         reader.releaseLock();
                     }
@@ -314,36 +375,46 @@ export default async function handler(req: Request, context: Context) {
         const writer = writable.getWriter();
 
         log('debug', `开始处理下行数据流`);
-        // 先发送 VLESS 响应
-        if (conn.vlessHeader) {
-            log('debug', `发送 VLESS 响应头`);
-            await writer.write(conn.vlessHeader.resp);
-        }
+        try {
+            // 先发送 VLESS 响应
+            if (conn.vlessHeader) {
+                log('debug', `发送 VLESS 响应头`);
+                await writer.write(conn.vlessHeader.resp);
+            }
 
-        // 处理缓存的数据
-        const bufferedData = Array.from(conn.buffer.entries())
-            .sort(([a], [b]) => a - b)
-            .map(([_, data]) => data);
-        
-        log('debug', `发送缓存数据包: ${bufferedData.length}个`);
-        for (const data of bufferedData) {
-            await writer.write(data);
-        }
-        conn.buffer.clear();
-        log('debug', `缓存已清空`);
+            // 处理缓存的数据
+            const bufferedData = Array.from(conn.buffer.entries())
+                .sort(([a], [b]) => a - b)
+                .map(([_, data]) => data);
+            
+            log('debug', `发送缓存数据包: ${bufferedData.length}个`);
+            for (const data of bufferedData) {
+                await writer.write(data);
+            }
+            conn.buffer.clear();
+            
+            // 开始数据转发
+            if (conn.remoteConnection) {
+                log('debug', `开始数据转发`);
+                conn.stream = writable;
+                relay(conn.remoteConnection, writer).catch((e) => {
+                    log('error', '转发错误:', e);
+                    connections.delete(uuid);
+                });
+            }
 
-        // 连接远程流
-        if (conn.remoteConnection) {
-            log('debug', `建立远程数据流管道`);
-            conn.stream = writable;
-            conn.remoteConnection.pipeTo(writable).catch((e: any) => {
-                log('error', 'Remote connection error:', e);
-                connections.delete(uuid);
+            return new Response(readable, {
+                headers: {
+                    ...responseHeaders,
+                    'Connection': 'keep-alive',
+                    'Transfer-Encoding': 'chunked'
+                }
             });
+        } catch (e) {
+            log('error', `处理下行数据错误:`, e);
+            connections.delete(uuid);
+            return new Response('Internal Server Error', { status: 500 });
         }
-
-        log('info', `数据流已建立`);
-        return new Response(readable, { headers: responseHeaders });
     }
 
     log('warn', `不支持的请求方法: ${req.method}`);
