@@ -116,47 +116,55 @@ export default async function handler(req: Request, context: Context) {
             connections.set(uuid, conn);
         }
 
-        const data = new Uint8Array(await req.arrayBuffer());
-        log('debug', `收到数据包: SEQ=${seqNum}, 大小=${data.length}字节`);
-        
-        // 如果是第一个包，需要解析 VLESS 头
-        if (seqNum === 0 && !conn.vlessHeader) {
-            log('info', `解析首个数据包的 VLESS 头`);
-            const reader = req.body?.getReader();
-            if (!reader) {
-                log('error', `无法获取请求体读取器`);
-                return new Response('Bad Request', { status: 400 });
-            }
-
-            try {
-                conn.vlessHeader = await read_vless_header(reader, SETTINGS.UUID);
-                log('info', `成功解析 VLESS 头: ${conn.vlessHeader.hostname}:${conn.vlessHeader.port}`);
+        try {
+            // 先获取完整的请求数据
+            const rawData = await req.arrayBuffer();
+            const data = new Uint8Array(rawData);
+            log('debug', `收到数据包: SEQ=${seqNum}, 大小=${data.length}字节`);
+            
+            // 如果是第一个包，需要解析 VLESS 头
+            if (seqNum === 0 && !conn.vlessHeader) {
+                log('info', `解析首个数据包的 VLESS 头`);
                 
-                // 建立远程连接
-                // 注意: 在 Edge Functions 中可能需要使用 fetch 替代 Deno.connect
-                log('debug', `尝试建立远程连接...`);
-                const resp = await fetch(`http://${conn.vlessHeader.hostname}:${conn.vlessHeader.port}`, {
-                    method: 'CONNECT',
-                    body: conn.vlessHeader.data
+                // 创建一个新的 ReadableStream 来处理数据
+                const stream = new ReadableStream({
+                    start(controller) {
+                        controller.enqueue(data);
+                        controller.close();
+                    }
                 });
                 
-                if (!resp.ok) {
-                    throw new Error(`远程连接失败: ${resp.status}`);
+                const reader = stream.getReader();
+                try {
+                    conn.vlessHeader = await read_vless_header(reader, SETTINGS.UUID);
+                    log('info', `成功解析 VLESS 头: ${conn.vlessHeader.hostname}:${conn.vlessHeader.port}`);
+                    
+                    log('debug', `尝试建立远程连接...`);
+                    const resp = await fetch(`http://${conn.vlessHeader.hostname}:${conn.vlessHeader.port}`, {
+                        method: 'CONNECT',
+                        body: conn.vlessHeader.data
+                    });
+                    
+                    if (!resp.ok) {
+                        throw new Error(`远程连接失败: ${resp.status}`);
+                    }
+                    conn.remoteConnection = resp.body;
+                    log('info', `远程连接建立成功`);
+                } finally {
+                    reader.releaseLock();
                 }
-                conn.remoteConnection = resp.body;
-                log('info', `远程连接建立成功`);
-            } catch (e) {
-                log('error', `处理 VLESS 头出错:`, e);
-                connections.delete(uuid);
-                return new Response('Bad Request', { status: 400 });
             }
+
+            conn.buffer.set(seqNum, data);
+            conn.lastActive = Date.now();
+            log('debug', `数据包已缓存: SEQ=${seqNum}`);
+
+            return new Response(null, { headers });
+        } catch (e) {
+            log('error', `处理请求出错:`, e);
+            connections.delete(uuid);
+            return new Response('Internal Server Error', { status: 500 });
         }
-
-        conn.buffer.set(seqNum, data);
-        conn.lastActive = Date.now();
-        log('debug', `数据包已缓存: SEQ=${seqNum}`);
-
-        return new Response(null, { headers });
     }
 
     // GET 请求处理(下行数据)
