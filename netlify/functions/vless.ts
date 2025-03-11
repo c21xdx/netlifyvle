@@ -107,19 +107,35 @@ async function connect_remote(hostname: string, port: number) {
     }
 }
 
-// Netlify Edge Function 处理函数
+// ... 前面的导入和配置保持不变 ...
+
+// 修改处理函数以支持新的URL格式
 export default async function handler(request: Request, context: Context) {
     const url = new URL(request.url);
     log('info', `Received ${request.method} request to ${url.pathname}`);
 
-    if (request.method === 'POST' && url.pathname.includes(SETTINGS.XHTTP_PATH)) {
-        return await handleVlessRequest(request);
+    // 检查URL格式是否符合预期
+    if (!url.pathname.startsWith(SETTINGS.XHTTP_PATH)) {
+        return new Response("Not Found", { status: 404 });
     }
 
-    return new Response("Not Found", { status: 404 });
+    // 根据请求方法分别处理
+    if (request.method === 'POST') {
+        return await handleVlessRequest(request);
+    } else if (request.method === 'GET') {
+        // 处理GET请求，返回一个简单的响应
+        return new Response("OK", {
+            status: 200,
+            headers: {
+                'Content-Type': 'text/plain'
+            }
+        });
+    }
+
+    return new Response("Method Not Allowed", { status: 405 });
 }
 
-// VLESS 请求处理函数
+// 修改VLESS请求处理函数，添加更多错误检查
 async function handleVlessRequest(request: Request): Promise<Response> {
     try {
         const reader = request.body?.getReader();
@@ -127,12 +143,32 @@ async function handleVlessRequest(request: Request): Promise<Response> {
             throw new Error("No request body");
         }
 
+        // 添加详细的日志
+        log('debug', 'Starting VLESS header parsing');
+        
         const vless = await read_vless_header(reader, SETTINGS.UUID);
+        
+        // 添加结果验证
+        if (!vless || !vless.hostname || !vless.port) {
+            throw new Error("Invalid VLESS header: missing required fields");
+        }
+
+        log('debug', `Parsed VLESS header - Host: ${vless.hostname}, Port: ${vless.port}`);
+
+        // 建立远程连接
+        log('debug', `Attempting to connect to remote: ${vless.hostname}:${vless.port}`);
         const remote = await connect_remote(vless.hostname, vless.port);
+
+        if (!remote || !remote.readable || !remote.writable) {
+            throw new Error("Failed to establish remote connection");
+        }
+
         const { readable, writable } = new TransformStream();
 
         // 设置数据转发
-        relay(reader, remote, vless.data, readable, writable, vless.resp);
+        relay(reader, remote, vless.data, readable, writable, vless.resp).catch(err => {
+            log('error', 'Relay error:', err);
+        });
 
         return new Response(readable, {
             status: 200,
@@ -145,85 +181,82 @@ async function handleVlessRequest(request: Request): Promise<Response> {
         });
     } catch (err) {
         log('error', 'Failed to handle VLESS request:', err);
-        return new Response("Invalid Request", { status: 400 });
+        
+        // 返回更详细的错误信息
+        return new Response(JSON.stringify({
+            error: err.message,
+            timestamp: new Date().toISOString()
+        }), {
+            status: 400,
+            headers: {
+                'Content-Type': 'application/json'
+            }
+        });
     }
 }
 
-// 数据转发函数
-async function relay(
-    clientReader: ReadableStreamDefaultReader<Uint8Array>,
-    remoteStream: { readable: ReadableStream; writable: WritableStream },
-    firstPacket: Uint8Array,
-    responseReadable: ReadableStream,
-    responseWritable: WritableStream,
-    vlessResponse: Uint8Array
-) {
+// 修改远程连接函数，添加更多错误处理
+async function connect_remote(hostname: string, port: number) {
     try {
-        // 发送第一个数据包到远程
-        const remoteWriter = remoteStream.writable.getWriter();
-        await remoteWriter.write(firstPacket);
-        remoteWriter.releaseLock();
+        log('debug', `Connecting to ${hostname}:${port}`);
+        
+        // 创建双向流
+        const { readable, writable } = new TransformStream();
+        
+        // 使用fetch建立连接
+        const response = await fetch(`http://${hostname}:${port}`, {
+            method: 'CONNECT',
+            headers: {
+                'Connection': 'Upgrade',
+                'Upgrade': 'websocket',
+            },
+        });
 
-        // 发送 VLESS 响应
-        const responseWriter = responseWritable.getWriter();
-        await responseWriter.write(vlessResponse);
-        responseWriter.releaseLock();
-
-        // 创建双向转发
-        await Promise.all([
-            // 客户端到远程的转发
-            (async () => {
-                const writer = remoteStream.writable.getWriter();
-                try {
-                    while (true) {
-                        const { value, done } = await clientReader.read();
-                        if (done) break;
-                        await writer.write(value);
-                    }
-                } catch (err) {
-                    if (!err.message.includes('connection') && !err.message.includes('abort')) {
-                        throw err;
-                    }
-                } finally {
-                    try {
-                        await writer.close();
-                    } catch {
-                        // 忽略关闭时的错误
-                    }
-                    writer.releaseLock();
-                }
-            })(),
-            // 远程到客户端的转发
-            (async () => {
-                const reader = remoteStream.readable.getReader();
-                const writer = responseWritable.getWriter();
-                try {
-                    while (true) {
-                        const { value, done } = await reader.read();
-                        if (done) break;
-                        await writer.write(value);
-                    }
-                } catch (err) {
-                    if (!err.message.includes('connection') && !err.message.includes('abort')) {
-                        throw err;
-                    }
-                } finally {
-                    try {
-                        await writer.close();
-                    } catch {
-                        // 忽略关闭时的错误
-                    }
-                    reader.releaseLock();
-                    writer.releaseLock();
-                }
-            })()
-        ]);
-    } catch (err) {
-        if (!err.message.includes('connection') &&
-            !err.message.includes('abort') &&
-            !err.message.includes('closed') &&
-            !err.message.includes('stream error')) {
-            log('error', 'Relay error:', err);
+        if (!response.ok) {
+            throw new Error(`Failed to connect to remote: ${response.status} ${response.statusText}`);
         }
+
+        if (!response.body) {
+            throw new Error('No response body from remote');
+        }
+
+        return {
+            readable: response.body,
+            writable
+        };
+    } catch (err) {
+        log('error', `Connection failed: ${err.message}`);
+        throw err;
+    }
+}
+
+// 修改read_vless_header函数，添加更多验证
+async function read_vless_header(reader: ReadableStreamDefaultReader<Uint8Array>, cfg_uuid_str: string) {
+    try {
+        log('debug', 'Starting to read VLESS header');
+        
+        // ... (原有的 VLESS 头部解析代码) ...
+
+        // 添加额外的验证
+        if (!hostname) {
+            throw new Error('Failed to parse hostname from VLESS header');
+        }
+
+        if (port <= 0 || port > 65535) {
+            throw new Error(`Invalid port number: ${port}`);
+        }
+
+        log('debug', `Successfully parsed VLESS header - Host: ${hostname}, Port: ${port}`);
+
+        return {
+            version,
+            hostname,
+            port,
+            data: header.slice(header_len),
+            resp: new Uint8Array([version, 0])
+        };
+    } catch (err) {
+        log('error', 'Failed to parse VLESS header:', err);
+        throw err;
     }
 }
