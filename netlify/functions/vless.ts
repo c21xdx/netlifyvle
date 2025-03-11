@@ -4,7 +4,7 @@ import { serve } from "https://deno.land/std/http/server.ts";
 // 核心配置
 const SETTINGS = {
     ['UUID']: '0cf85927-2c71-4e87-9df3-b1eb7d5a9e1b', // vless UUID
-    ['LOG_LEVEL']: 'debug',  // 改为 info 级别
+    ['LOG_LEVEL']: 'info',  // 改为 info 级别
     ['BUFFER_SIZE']: '128', // 缓冲区大小 KiB
     ['XHTTP_PATH']: '/xblog', // XHTTP 路径
 } as const;
@@ -22,7 +22,6 @@ function log(type: string, ...args: unknown[]) {
     // 检查当前日志级别是否应该输出
     const currentLevel = LOG_LEVELS[type as keyof typeof LOG_LEVELS] || 0;
     const configLevel = LOG_LEVELS[SETTINGS.LOG_LEVEL as keyof typeof LOG_LEVELS] || 1;
-    
     if (currentLevel >= configLevel) {
         const time = new Date().toISOString();
         console.log(`[${time}] [${type}]`, ...args);
@@ -87,11 +86,9 @@ async function read_vless_header(reader: ReadableStreamDefaultReader<Uint8Array>
     const ADDRESS_TYPE_IPV4 = 1;
     const ADDRESS_TYPE_STRING = 2;
     const ADDRESS_TYPE_IPV6 = 3;
-
     log('debug', 'Starting to read VLESS header');
     let readed_len = 0;
     let header = new Uint8Array();
-
     let read_result = { value: header, done: false };
     async function inner_read_until(offset: number) {
         if (read_result.done) {
@@ -103,28 +100,22 @@ async function read_vless_header(reader: ReadableStreamDefaultReader<Uint8Array>
         readed_len += read_result.value.length;
         header = concat_typed_arrays(header, read_result.value);
     }
-
     await inner_read_until(1 + 16 + 1);
-
     const version = header[0];
     const uuid = header.slice(1, 1 + 16);
     const cfg_uuid = parse_uuid(cfg_uuid_str);
     if (!validate_uuid(uuid, cfg_uuid)) {
         throw new Error(`invalid UUID`);
     }
-
     const pb_len = header[1 + 16];
     const addr_plus1 = 1 + 16 + 1 + pb_len + 1 + 2 + 1;
     await inner_read_until(addr_plus1 + 1);
-
     const cmd = header[1 + 16 + 1 + pb_len];
     if (cmd !== COMMAND_TYPE_TCP) {
         throw new Error(`unsupported command: ${cmd}`);
     }
-
     const port = (header[addr_plus1 - 1 - 2] << 8) + header[addr_plus1 - 1 - 1];
     const atype = header[addr_plus1 - 1];
-
     let header_len = -1;
     if (atype === ADDRESS_TYPE_IPV4) {
         header_len = addr_plus1 + 4;
@@ -137,7 +128,6 @@ async function read_vless_header(reader: ReadableStreamDefaultReader<Uint8Array>
         throw new Error('read address type failed');
     }
     await inner_read_until(header_len);
-
     const idx = addr_plus1;
     let hostname = '';
     if (atype === ADDRESS_TYPE_IPV4) {
@@ -156,14 +146,11 @@ async function read_vless_header(reader: ReadableStreamDefaultReader<Uint8Array>
             )
             .join(':');
     }
-
     log('info', `VLESS connection to ${hostname}:${port}`);
-
     if (!hostname) {
         log('error', 'Failed to parse hostname');
         throw new Error('parse hostname failed');
     }
-
     return {
         version,
         hostname,
@@ -234,11 +221,9 @@ function tcpToWebStream(conn: Deno.Conn) {
 async function handleRequest(request: Request): Promise<Response> {
     const url = new URL(request.url);
     log('info', `Received ${request.method} request to ${url.pathname}`);
-
     if (request.method === 'POST' && url.pathname.includes(SETTINGS.XHTTP_PATH)) {
         return await handleVlessRequest(request);
     }
-
     return new Response("Not Found", { status: 404 });
 }
 
@@ -248,14 +233,11 @@ async function handleVlessRequest(request: Request): Promise<Response> {
         if (!reader) {
             throw new Error("No request body");
         }
-
         const vless = await read_vless_header(reader, SETTINGS.UUID);
         const remote = await connect_remote(vless.hostname, vless.port);
         const remoteStream = tcpToWebStream(remote);
         const { readable, writable } = new TransformStream();
-
         relay(reader, remoteStream, vless.data, readable, writable, vless.resp);
-
         return new Response(readable, {
             status: 200,
             headers: {
@@ -284,12 +266,10 @@ async function relay(
         const remoteWriter = remoteStream.writable.getWriter();
         await remoteWriter.write(firstPacket);
         remoteWriter.releaseLock();
-
         // 发送 VLESS 响应
         const responseWriter = responseWritable.getWriter();
         await responseWriter.write(vlessResponse);
         responseWriter.releaseLock();
-
         // 创建双向转发
         await Promise.all([
             // 客户端到远程的转发
@@ -353,7 +333,15 @@ async function relay(
 }
 
 // 启动服务器
-const port = parseInt(Deno.env.get("PORT") || "3000");
-log('info', `Server running on port ${port}`);
+async function startServer() {
+    try {
+        const port = parseInt(Deno.env.get("PORT") || "3000");
+        log('info', `Server running on port ${port}`);
+        await serve(handleRequest, { port });
+    } catch (err) {
+        log('error', 'Failed to start server:', err);
+    }
+}
 
-await serve(handleRequest, { port });
+// 调用启动函数
+startServer();
