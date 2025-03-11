@@ -72,20 +72,21 @@ export default async function handler(req: Request, context: Context) {
     log('debug', `收到请求: ${req.method} ${url.pathname}`);
     
     // 检查路径是否包含配置的 XHTTP_PATH
-    if (!url.pathname.includes(SETTINGS.XHTTP_PATH)) {
+    if (!url.pathname.startsWith(SETTINGS.XHTTP_PATH)) {
         log('debug', `路径不匹配 XHTTP_PATH: ${url.pathname}`);
         return new Response('Not Found', { status: 404 });
     }
     
-    const parts = url.pathname.split('/');
-    if (parts.length < 3) {
+    // 修改路径解析逻辑，正确提取 UUID 和 seq
+    const pathParts = url.pathname.substring(SETTINGS.XHTTP_PATH.length).split('/').filter(p => p);
+    if (pathParts.length < 2) {
         log('debug', `路径格式错误: ${url.pathname}`);
         return new Response('Not Found', { status: 404 });
     }
 
-    const uuid = parts[parts.length - 2];
-    const seq = parts[parts.length - 1];
-    log('debug', `UUID: ${uuid}, SEQ: ${seq}`);
+    const uuid = pathParts[0];  // 第一个部分是 UUID
+    const seq = pathParts[1];   // 第二个部分是 seq
+    log('debug', `解析路径: UUID=${uuid}, SEQ=${seq}`);
 
     // 通用响应头
     const headers = {
@@ -123,35 +124,47 @@ export default async function handler(req: Request, context: Context) {
             log('debug', `收到数据包: SEQ=${seqNum}, 大小=${data.length}字节`);
             
             // 如果是第一个包，需要解析 VLESS 头
-            if (seqNum === 0 && !conn.vlessHeader) {
+            if (seqNum === 0 && (!conn.vlessHeader || !conn.remoteConnection)) {
                 log('info', `解析首个数据包的 VLESS 头`);
                 
-                // 创建一个新的 ReadableStream 来处理数据
-                const stream = new ReadableStream({
-                    start(controller) {
-                        controller.enqueue(data);
-                        controller.close();
-                    }
-                });
-                
-                const reader = stream.getReader();
                 try {
-                    conn.vlessHeader = await read_vless_header(reader, SETTINGS.UUID);
-                    log('info', `成功解析 VLESS 头: ${conn.vlessHeader.hostname}:${conn.vlessHeader.port}`);
-                    
-                    log('debug', `尝试建立远程连接...`);
-                    const resp = await fetch(`http://${conn.vlessHeader.hostname}:${conn.vlessHeader.port}`, {
-                        method: 'CONNECT',
-                        body: conn.vlessHeader.data
+                    // 创建新的流来处理数据
+                    const stream = new ReadableStream({
+                        start(controller) {
+                            controller.enqueue(data);
+                            controller.close();
+                        }
                     });
                     
-                    if (!resp.ok) {
-                        throw new Error(`远程连接失败: ${resp.status}`);
+                    const reader = stream.getReader();
+                    try {
+                        const vlessHeader = await read_vless_header(reader, SETTINGS.UUID);
+                        if (!vlessHeader || !vlessHeader.hostname) {
+                            throw new Error('Invalid VLESS header or missing hostname');
+                        }
+                        
+                        log('info', `成功解析 VLESS 头: ${vlessHeader.hostname}:${vlessHeader.port}`);
+                        
+                        log('debug', `尝试建立远程连接...`);
+                        const resp = await fetch(`http://${vlessHeader.hostname}:${vlessHeader.port}`, {
+                            method: 'CONNECT',
+                            body: vlessHeader.data
+                        });
+                        
+                        if (!resp.ok) {
+                            throw new Error(`远程连接失败: ${resp.status}`);
+                        }
+                        
+                        conn.vlessHeader = vlessHeader;
+                        conn.remoteConnection = resp.body;
+                        log('info', `远程连接建立成功`);
+                    } finally {
+                        reader.releaseLock();
                     }
-                    conn.remoteConnection = resp.body;
-                    log('info', `远程连接建立成功`);
-                } finally {
-                    reader.releaseLock();
+                } catch (e) {
+                    log('error', `VLESS 头解析或连接失败:`, e);
+                    connections.delete(uuid);
+                    return new Response('Bad Request', { status: 400 });
                 }
             }
 
