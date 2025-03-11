@@ -1,12 +1,12 @@
-import { Context } from "https://edge.netlify.com";
+// 导入 Deno 标准库
+import { serve } from "https://deno.land/std/http/server.ts";
 
 // 核心配置
 const SETTINGS = {
-    ['UUID']: '0cf85927-2c71-4e87-9df3-b1eb7d5a9e1b',
-    ['LOG_LEVEL']: 'debug',  // 改为debug级别以输出更多信息
-    ['BUFFER_SIZE']: '128',
-    ['XHTTP_PATH']: '/xblog',
-    ['LOG_DETAIL']: true,    // 是否输出详细日志
+    ['UUID']: '0cf85927-2c71-4e87-9df3-b1eb7d5a9e1b', // vless UUID
+    ['LOG_LEVEL']: 'debug',  // 改为 info 级别
+    ['BUFFER_SIZE']: '128', // 缓冲区大小 KiB
+    ['XHTTP_PATH']: '/xblog', // XHTTP 路径
 } as const;
 
 // 定义日志级别
@@ -18,10 +18,15 @@ const LOG_LEVELS = {
 } as const;
 
 // 工具函数
-// 修改log函数，确保始终输出关键日志
 function log(type: string, ...args: unknown[]) {
-    const time = new Date().toISOString();
-    console.log(`[${time}] [${type}]`, ...args);
+    // 检查当前日志级别是否应该输出
+    const currentLevel = LOG_LEVELS[type as keyof typeof LOG_LEVELS] || 0;
+    const configLevel = LOG_LEVELS[SETTINGS.LOG_LEVEL as keyof typeof LOG_LEVELS] || 1;
+    
+    if (currentLevel >= configLevel) {
+        const time = new Date().toISOString();
+        console.log(`[${time}] [${type}]`, ...args);
+    }
 }
 
 function validate_uuid(left: Uint8Array, right: Uint8Array): boolean {
@@ -168,99 +173,187 @@ async function read_vless_header(reader: ReadableStreamDefaultReader<Uint8Array>
     };
 }
 
-// 添加handleVlessRequest函数的实现
-async function handleVlessRequest(req: Request) {
-    log('info', '开始处理VLESS请求');
+// 网络相关函数
+async function connect_remote(hostname: string, port: number) {
     try {
-        const reader = req.body?.getReader();
+        const conn = await Deno.connect({
+            hostname,
+            port,
+            transport: "tcp"
+        });
+        return conn;
+    } catch (err) {
+        log('error', `Connection failed: ${err.message}`);
+        throw err;
+    }
+}
+
+function tcpToWebStream(conn: Deno.Conn) {
+    return {
+        readable: new ReadableStream({
+            async start(controller) {
+                try {
+                    const buf = new Uint8Array(16384);
+                    while (true) {
+                        const n = await conn.read(buf);
+                        if (n === null) {
+                            controller.close();
+                            break;
+                        }
+                        controller.enqueue(buf.slice(0, n));
+                    }
+                } catch (err) {
+                    controller.error(err);
+                }
+            },
+            cancel() {
+                conn.close();
+            }
+        }),
+        writable: new WritableStream({
+            async write(chunk) {
+                try {
+                    await conn.write(new Uint8Array(chunk));
+                } catch (err) {
+                    log('error', 'Write error:', err);
+                    throw err;
+                }
+            },
+            close() {
+                conn.close();
+            },
+            abort(err) {
+                log('error', 'Stream aborted:', err);
+                conn.close();
+            }
+        })
+    };
+}
+
+// 请求处理函数
+async function handleRequest(request: Request): Promise<Response> {
+    const url = new URL(request.url);
+    log('info', `Received ${request.method} request to ${url.pathname}`);
+
+    if (request.method === 'POST' && url.pathname.includes(SETTINGS.XHTTP_PATH)) {
+        return await handleVlessRequest(request);
+    }
+
+    return new Response("Not Found", { status: 404 });
+}
+
+async function handleVlessRequest(request: Request): Promise<Response> {
+    try {
+        const reader = request.body?.getReader();
         if (!reader) {
-            throw new Error('请求体为空');
+            throw new Error("No request body");
         }
 
         const vless = await read_vless_header(reader, SETTINGS.UUID);
-        log('debug', `VLESS解析结果: 版本=${vless.version}, 目标=${vless.hostname}:${vless.port}`);
-
-        // 创建用于发送到目标服务器的数据流
+        const remote = await connect_remote(vless.hostname, vless.port);
+        const remoteStream = tcpToWebStream(remote);
         const { readable, writable } = new TransformStream();
-        const writer = writable.getWriter();
 
-        // 发送初始数据
-        if (vless.data.length > 0) {
-            await writer.write(vless.data);
-        }
+        relay(reader, remoteStream, vless.data, readable, writable, vless.resp);
 
-        // 处理剩余数据流
-        (async () => {
-            try {
-                while (true) {
-                    const { done, value } = await reader.read();
-                    if (done) break;
-                    await writer.write(value);
-                }
-            } catch (error) {
-                log('error', '处理数据流时出错:', error);
-            } finally {
-                writer.close().catch(() => {});
-            }
-        })();
-
-        // 准备请求目标服务器
-        const protocol = vless.port === 443 ? 'https' : 'http';
-        const targetUrl = `${protocol}://${vless.hostname}`;
-        log('debug', `正在连接到目标服务器: ${targetUrl}`);
-
-        // 发送请求到目标服务器
-        const response = await fetch(targetUrl, {
-            method: 'POST',
+        return new Response(readable, {
+            status: 200,
             headers: {
-                'Host': vless.hostname,
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
-                'Accept': '*/*',
-                'Accept-Language': 'en-US,en;q=0.9',
-                'Connection': 'keep-alive'
-            },
-            body: readable,
-            duplex: 'half',
-        });
-
-        // 创建响应转换流
-        const { readable: processedReadable, writable: processedWritable } = new TransformStream({
-            start(controller) {
-                controller.enqueue(vless.resp);
+                'Content-Type': 'application/grpc',
+                'X-Request-Id': Math.random().toString(36).substring(2),
+                'X-Response-Id': '1',
+                'X-Stream-Mode': 'one'
             }
         });
-
-        // 转发响应数据
-        if (response.body) {
-            response.body.pipeTo(processedWritable).catch(error => {
-                log('error', '转发响应数据时出错:', error);
-            });
-        }
-
-        return new Response(processedReadable, {
-            headers: {
-                'Content-Type': 'application/octet-stream',
-                'Connection': 'keep-alive',
-                'Cache-Control': 'no-store',
-            }
-        });
-
     } catch (err) {
-        log('error', `处理VLESS请求失败: ${err.message}`);
-        return new Response(`Internal Server Error: ${err.message}`, { status: 500 });
+        log('error', 'Failed to handle VLESS request:', err);
+        return new Response("Invalid Request", { status: 400 });
     }
 }
 
-export default async function handler(req: Request, context: Context) {
-    const url = new URL(req.url);
-    log('info', `收到请求: ${req.method} ${url.pathname}`);
+async function relay(
+    clientReader: ReadableStreamDefaultReader<Uint8Array>,
+    remoteStream: { readable: ReadableStream; writable: WritableStream },
+    firstPacket: Uint8Array,
+    responseReadable: ReadableStream,
+    responseWritable: WritableStream,
+    vlessResponse: Uint8Array
+) {
+    try {
+        // 发送第一个数据包到远程
+        const remoteWriter = remoteStream.writable.getWriter();
+        await remoteWriter.write(firstPacket);
+        remoteWriter.releaseLock();
 
-    // 修改路径匹配逻辑：使用startsWith检查前缀
-    if (req.method === 'POST' && url.pathname.startsWith(SETTINGS.XHTTP_PATH)) {
-        log('info', `匹配到VLESS请求路径: ${url.pathname}`);
-        return await handleVlessRequest(req);
+        // 发送 VLESS 响应
+        const responseWriter = responseWritable.getWriter();
+        await responseWriter.write(vlessResponse);
+        responseWriter.releaseLock();
+
+        // 创建双向转发
+        await Promise.all([
+            // 客户端到远程的转发
+            (async () => {
+                const writer = remoteStream.writable.getWriter();
+                try {
+                    while (true) {
+                        const { value, done } = await clientReader.read();
+                        if (done) break;
+                        await writer.write(value);
+                    }
+                } catch (err) {
+                    // 忽略连接关闭和中止的错误
+                    if (!err.message.includes('connection') && !err.message.includes('abort')) {
+                        throw err;
+                    }
+                } finally {
+                    try {
+                        await writer.close();
+                    } catch {
+                        // 忽略关闭时的错误
+                    }
+                    writer.releaseLock();
+                }
+            })(),
+            // 远程到客户端的转发
+            (async () => {
+                const reader = remoteStream.readable.getReader();
+                const writer = responseWritable.getWriter();
+                try {
+                    while (true) {
+                        const { value, done } = await reader.read();
+                        if (done) break;
+                        await writer.write(value);
+                    }
+                } catch (err) {
+                    // 忽略连接关闭和中止的错误
+                    if (!err.message.includes('connection') && !err.message.includes('abort')) {
+                        throw err;
+                    }
+                } finally {
+                    try {
+                        await writer.close();
+                    } catch {
+                        // 忽略关闭时的错误
+                    }
+                    reader.releaseLock();
+                    writer.releaseLock();
+                }
+            })()
+        ]);
+    } catch (err) {
+        // 只记录重要错误
+        if (!err.message.includes('connection') &&
+            !err.message.includes('abort') &&
+            !err.message.includes('closed') &&
+            !err.message.includes('stream error')) {
+            log('error', 'Relay error:', err);
+        }
     }
-
-    log('info', '未匹配到VLESS路径，返回404');
-    return new Response("Not Found", { status: 404 });
 }
+
+// 启动服务器
+const port = parseInt(Deno.env.get("PORT") || "3000");
+log('info', `Server running on port ${port}`);
+
+await serve(handleRequest, { port });
