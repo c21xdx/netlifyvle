@@ -179,94 +179,77 @@ async function read_vless_header(reader: ReadableStreamDefaultReader<Uint8Array>
 
 // 在 connections 定义前添加远程连接和转发相关函数
 async function connect_remote(hostname: string, port: number) {
-    const maxRetries = 2;
-    const methods = ['GET', 'HEAD', 'POST'];
-    
-    for (let i = 0; i < maxRetries; i++) {
-        for (const method of methods) {
-            try {
-                log('debug', `尝试使用 ${method} 连接到 ${hostname}:${port} (尝试 ${i + 1}/${maxRetries})`);
-                const resp = await fetch(`https://${hostname}:${port}`, {
-                    method,
-                    headers: {
-                        'Host': hostname,
-                        'Connection': 'keep-alive',
-                        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
-                        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
-                        'Accept-Language': 'en-US,en;q=0.9'
-                    },
-                    redirect: 'follow',
-                    duplex: 'half'
-                });
-
-                // 任何响应都可以接受，因为我们只需要建立连接
-                const stream = resp.body;
-                if (!stream) {
-                    throw new Error('No response body');
-                }
-
-                log('debug', `成功建立连接，响应状态: ${resp.status}`);
-                return stream;
-            } catch (err) {
-                log('warn', `${method} 连接失败: ${err.message}`);
-                // 最后一次尝试失败时抛出错误
-                if (i === maxRetries - 1 && method === methods[methods.length - 1]) {
-                    throw err;
-                }
-            }
-        }
+    try {
+        const targetUrl = `https://${hostname}:${port}`;
+        log('debug', `尝试连接到目标服务器: ${targetUrl}`);
         
-        // 重试前等待一小段时间
-        if (i < maxRetries - 1) {
-            await new Promise(resolve => setTimeout(resolve, 100));
-        }
-    }
+        const response = await fetch(targetUrl, {
+            method: 'CONNECT',  // 使用 CONNECT 方法
+            headers: {
+                'Host': hostname,
+                'Connection': 'keep-alive',
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
+                'Accept': '*/*'
+            },
+            redirect: 'follow',
+            duplex: 'half'
+        });
 
-    throw new Error('All connection attempts failed');
+        if (!response.ok && response.status !== 200) {
+            throw new Error(`远程连接失败: ${response.status}`);
+        }
+
+        const stream = response.body;
+        if (!stream) {
+            throw new Error('未获取到响应流');
+        }
+
+        log('debug', `成功建立连接，响应状态: ${response.status}`);
+        return {
+            stream,
+            response
+        };
+    } catch (err) {
+        log('error', `连接远程服务器失败: ${err.message}`);
+        throw err;
+    }
 }
 
 async function relay(
-    remoteStream: ReadableStream,
+    remoteResponse: { stream: ReadableStream, response: Response },
     responseWriter: WritableStreamDefaultWriter<any>,
     firstPacket?: Uint8Array
 ) {
     try {
-        // 创建双向管道
-        const pipeGenerator = new TransformStream();
-        const pipeWriter = pipeGenerator.writable.getWriter();
-
-        // 启动远程数据读取
+        const remoteStream = remoteResponse.stream;
         const remoteReader = remoteStream.getReader();
         
-        (async () => {
-            try {
-                while (true) {
-                    const { value, done } = await remoteReader.read();
-                    if (done) {
-                        log('debug', '远程连接已结束');
-                        break;
-                    }
-                    if (value) {
-                        log('debug', `接收远程数据: ${value.length} 字节`);
-                        await responseWriter.write(value);
-                    }
-                }
-            } catch (e) {
-                log('error', '读取远程数据错误:', e);
-            } finally {
-                try {
-                    await responseWriter.close();
-                } catch (e) {
-                    // 忽略关闭错误
-                }
-                remoteReader.releaseLock();
-            }
-        })();
+        // 先写入首包数据（如果有）
+        if (firstPacket) {
+            await responseWriter.write(firstPacket);
+        }
 
-        return pipeGenerator.readable;
+        // 持续转发数据
+        while (true) {
+            const { value, done } = await remoteReader.read();
+            if (done) {
+                log('debug', '远程连接已结束');
+                break;
+            }
+            if (value) {
+                log('debug', `转发远程数据: ${value.length} 字节`);
+                await responseWriter.write(value);
+            }
+        }
     } catch (err) {
-        log('error', '创建数据管道错误:', err);
+        log('error', '数据转发错误:', err);
         throw err;
+    } finally {
+        try {
+            await responseWriter.close();
+        } catch (e) {
+            // 忽略关闭错误
+        }
     }
 }
 
