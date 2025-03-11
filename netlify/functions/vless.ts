@@ -174,27 +174,50 @@ async function read_vless_header(reader: ReadableStreamDefaultReader<Uint8Array>
 
 // 在 connections 定义前添加远程连接和转发相关函数
 async function connect_remote(hostname: string, port: number) {
-    try {
-        // 使用 HTTPS 请求替代 CONNECT
-        const resp = await fetch(`https://${hostname}:${port}`, {
-            method: 'POST',
-            headers: {
-                'Host': hostname,
-                'Connection': 'keep-alive'
-            },
-            // 设置流模式以支持大数据传输
-            duplex: 'half'
-        });
-        
-        if (!resp.ok && resp.status !== 101) { // 101 是协议升级状态码
-            throw new Error(`Failed to connect: ${resp.status}`);
+    const maxRetries = 2;
+    const methods = ['GET', 'HEAD', 'POST'];
+    
+    for (let i = 0; i < maxRetries; i++) {
+        for (const method of methods) {
+            try {
+                log('debug', `尝试使用 ${method} 连接到 ${hostname}:${port} (尝试 ${i + 1}/${maxRetries})`);
+                const resp = await fetch(`https://${hostname}:${port}`, {
+                    method,
+                    headers: {
+                        'Host': hostname,
+                        'Connection': 'keep-alive',
+                        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
+                        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
+                        'Accept-Language': 'en-US,en;q=0.9'
+                    },
+                    redirect: 'follow',
+                    duplex: 'half'
+                });
+
+                // 任何响应都可以接受，因为我们只需要建立连接
+                const stream = resp.body;
+                if (!stream) {
+                    throw new Error('No response body');
+                }
+
+                log('debug', `成功建立连接，响应状态: ${resp.status}`);
+                return stream;
+            } catch (err) {
+                log('warn', `${method} 连接失败: ${err.message}`);
+                // 最后一次尝试失败时抛出错误
+                if (i === maxRetries - 1 && method === methods[methods.length - 1]) {
+                    throw err;
+                }
+            }
         }
         
-        return resp.body;
-    } catch (err) {
-        log('error', `连接失败: ${err.message}`);
-        throw err;
+        // 重试前等待一小段时间
+        if (i < maxRetries - 1) {
+            await new Promise(resolve => setTimeout(resolve, 100));
+        }
     }
+
+    throw new Error('All connection attempts failed');
 }
 
 async function relay(
