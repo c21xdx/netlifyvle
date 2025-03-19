@@ -48,13 +48,15 @@ const blacklist = new Map<string, {
     lastFail: number;
 }>();
 
-// 修改黑名单相关配置
+// 修改连接配置
 const CONNECTION_CONFIG = {
-    TIMEOUT: 5000,          // 连接超时时间
-    BAN_TIME: 60000,        // 基础封禁时间（1分钟）
-    MAX_FAIL_COUNT: 3,      // 最大失败次数
-    WHITELIST: [            // 白名单
-        '1.187.2.14',       // 添加你的目标服务器
+    TIMEOUT: 3000,          // 减少连接超时时间到3秒
+    RETRY_TIMES: 2,         // 添加重试次数
+    RETRY_DELAY: 1000,      // 重试延迟1秒
+    BAN_TIME: 60000,        // 保持封禁时间1分钟
+    MAX_FAIL_COUNT: 3,      // 保持最大失败次数
+    WHITELIST: [            // 扩展白名单
+        '1.187.2.14',
         'localhost',
         '127.0.0.1'
     ]
@@ -223,8 +225,34 @@ function validateUUID(test: Uint8Array, against: string): boolean {
     return true;
 }
 
-// 修改连接处理函数
+// 添加重试逻辑的连接函数
 async function connectToTarget(host: string, port: number): Promise<net.Socket> {
+    let lastError;
+    
+    for (let i = 0; i <= CONNECTION_CONFIG.RETRY_TIMES; i++) {
+        if (i > 0) {
+            log.info(`Retry attempt ${i} for ${host}:${port}`);
+            await new Promise(r => setTimeout(r, CONNECTION_CONFIG.RETRY_DELAY));
+        }
+
+        try {
+            const socket = await connectWithTimeout(host, port);
+            if (i > 0) {
+                log.info(`Successful connection after ${i} retries`);
+            }
+            return socket;
+        } catch (err) {
+            lastError = err;
+            log.warn(`Connection attempt ${i + 1} failed:`, err.message);
+            continue;
+        }
+    }
+    
+    throw lastError;
+}
+
+// 分离超时连接逻辑
+function connectWithTimeout(host: string, port: number): Promise<net.Socket> {
     // 检查黑名单状态
     if (!checkBlacklist(host)) {
         const record = blacklist.get(host);
@@ -233,22 +261,23 @@ async function connectToTarget(host: string, port: number): Promise<net.Socket> 
     }
 
     return new Promise((resolve, reject) => {
+        let timeoutId: NodeJS.Timeout;
+        let isResolved = false;
+
         const socket = net.createConnection({
             host: host,
-            port: port,
-            timeout: CONNECTION_CONFIG.TIMEOUT
+            port: port
         });
-
-        let isResolved = false;
 
         const cleanup = () => {
             clearTimeout(timeoutId);
+            socket.removeAllListeners();
             if (!isResolved) {
                 socket.destroy();
             }
         };
 
-        const timeoutId = setTimeout(() => {
+        timeoutId = setTimeout(() => {
             cleanup();
             updateBlacklist(host);
             reject(new Error('Connection timeout'));
@@ -257,9 +286,14 @@ async function connectToTarget(host: string, port: number): Promise<net.Socket> 
         socket.once('connect', () => {
             isResolved = true;
             cleanup();
-            socket.setTimeout(0);
             
-            // 连接成功，重置失败计数
+            // 连接成功后设置新的超时处理
+            socket.setTimeout(CONNECTION_CONFIG.TIMEOUT);
+            socket.on('timeout', () => {
+                socket.destroy(new Error('Operation timeout'));
+            });
+            
+            // 连接成功，重置黑名单状态
             if (blacklist.has(host)) {
                 blacklist.delete(host);
             }
@@ -275,16 +309,22 @@ async function connectToTarget(host: string, port: number): Promise<net.Socket> 
     });
 }
 
-// 添加黑名单更新函数
+// 优化黑名单更新函数
 function updateBlacklist(host: string): void {
-    // 白名单主机不加入黑名单
     if (CONNECTION_CONFIG.WHITELIST.includes(host)) {
         return;
     }
 
     const record = blacklist.get(host) || { failCount: 0, lastFail: 0 };
+    const now = Date.now();
+    
+    // 如果距离上次失败超过封禁时间，重置计数
+    if (now - record.lastFail > CONNECTION_CONFIG.BAN_TIME) {
+        record.failCount = 0;
+    }
+    
     record.failCount++;
-    record.lastFail = Date.now();
+    record.lastFail = now;
     blacklist.set(host, record);
     
     log.warn(`Updated blacklist for ${host}: fail count = ${record.failCount}`);
@@ -431,14 +471,21 @@ export const handler: Handler = async (event, context) => {
                     if (vlessHeader.remainData) {
                         socket.write(vlessHeader.remainData);
                     }
+
+                    // 设置连接空闲超时
+                    socket.setTimeout(CONNECTION_CONFIG.TIMEOUT);
+                    socket.on('timeout', () => {
+                        log.warn(`Connection to ${vlessHeader.target.host}:${vlessHeader.target.port} timed out`);
+                        socket.destroy();
+                    });
                 } catch (err) {
                     log.error('Failed to establish connection:', err.message);
                     return { 
                         statusCode: 503,
-                        body: err.message,
+                        body: `Connection failed: ${err.message}`,
                         headers: {
                             ...headers,
-                            'Retry-After': '10'
+                            'Retry-After': '5'
                         }
                     };
                 }
