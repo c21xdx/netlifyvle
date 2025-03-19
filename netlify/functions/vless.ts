@@ -233,48 +233,59 @@ export const handler = async (request: Request, context: Context) => {
         'X-Accel-Buffering': 'no'
     };
 
-    const url = new URL(request.url);
-    const pathMatch = url.pathname.match(new RegExp(`${SETTINGS.XHTTP_PATH}/([^/]+)(?:/([0-9]+))?$`));
-    
-    if (!pathMatch) {
-        return new Response('Not Found', { status: 404 });
-    }
+    try {
+        // 修正 URL 处理
+        const url = new URL(request.url, 'http://' + request.headers.get('host') || 'localhost');
+        const pathMatch = url.pathname.match(new RegExp(`${SETTINGS.XHTTP_PATH}/([^/]+)(?:/([0-9]+))?$`));
+        
+        if (!pathMatch) {
+            return new Response('Not Found', { status: 404 });
+        }
 
-    const uuid = pathMatch[1];
-    const seq = pathMatch[2] ? parseInt(pathMatch[2]) : null;
+        const uuid = pathMatch[1];
+        const seq = pathMatch[2] ? parseInt(pathMatch[2]) : null;
 
-    // GET 请求处理下行流
-    if (request.method === 'GET' && !seq) {
-        let session = sessions.get(uuid);
-        if (!session) {
-            session = new Session(uuid);
-            sessions.set(uuid, session);
+        // GET 请求处理下行流
+        if (request.method === 'GET' && !seq) {
+            let session = sessions.get(uuid);
+            if (!session) {
+                session = new Session(uuid);
+                sessions.set(uuid, session);
+            }
+            
+            headers['Content-Type'] = 'application/octet-stream';
+            return session.getResponse(headers);
         }
         
-        headers['Content-Type'] = 'application/octet-stream';
-        return session.getResponse(headers);
-    }
-    
-    // POST 请求处理上行数据
-    if (request.method === 'POST' && seq !== null) {
-        let session = sessions.get(uuid);
-        if (!session) {
-            session = new Session(uuid);
-            sessions.set(uuid, session);
+        // POST 请求处理上行数据
+        if (request.method === 'POST' && seq !== null) {
+            let session = sessions.get(uuid);
+            if (!session) {
+                session = new Session(uuid);
+                sessions.set(uuid, session);
+            }
+
+            try {
+                const buffer = await request.arrayBuffer();
+                await session.processPacket(seq, new Uint8Array(buffer));
+                return new Response('OK', { status: 200, headers });
+            } catch (err) {
+                session.cleanup();
+                sessions.delete(uuid);
+                return new Response('Internal Server Error', { status: 500 });
+            }
         }
 
-        try {
-            const buffer = await request.arrayBuffer();
-            await session.processPacket(seq, new Uint8Array(buffer));
-            return new Response('OK', { status: 200, headers });
-        } catch (err) {
-            session.cleanup();
-            sessions.delete(uuid);
-            return new Response('Internal Server Error', { status: 500 });
-        }
+        return new Response('Not Found', { status: 404 });
+    } catch (err) {
+        console.error('Handler error:', err);
+        return new Response('Internal Server Error', { 
+            status: 500,
+            headers: {
+                'Content-Type': 'text/plain'
+            }
+        });
     }
-
-    return new Response('Not Found', { status: 404 });
 };
 
 export const config = {
