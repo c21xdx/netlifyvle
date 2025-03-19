@@ -42,6 +42,35 @@ const sessions = new Map<string, {
     lastActive: number;
 }>();
 
+// 添加连接黑名单
+const blacklist = new Map<string, {
+    failCount: number;
+    lastFail: number;
+}>();
+
+// 添加黑名单检查和清理函数
+function checkBlacklist(host: string): boolean {
+    const now = Date.now();
+    const record = blacklist.get(host);
+    
+    // 清理过期黑名单
+    for (const [h, r] of blacklist.entries()) {
+        if (now - r.lastFail > 300000) { // 5分钟后重置
+            blacklist.delete(h);
+        }
+    }
+    
+    if (!record) return true;
+    
+    // 失败次数越多，封禁时间越长
+    const banTime = Math.min(record.failCount * 60000, 300000); // 最长5分钟
+    if (now - record.lastFail < banTime) {
+        return false;
+    }
+    
+    return true;
+}
+
 function randomPadding(): string {
     const len = 100 + Math.floor(Math.random() * 900);
     return 'X'.repeat(len);
@@ -173,24 +202,52 @@ function validateUUID(test: Uint8Array, against: string): boolean {
 
 // 修改连接超时设置
 async function connectToTarget(host: string, port: number): Promise<net.Socket> {
+    if (!checkBlacklist(host)) {
+        throw new Error('Target temporarily blocked due to connection failures');
+    }
+
     return new Promise((resolve, reject) => {
         const socket = net.createConnection({
             host: host,
             port: port,
-            timeout: 5000  // 5秒超时
+            timeout: 5000
         });
 
-        socket.on('connect', () => {
-            socket.setTimeout(0);  // 连接成功后取消超时
+        let isResolved = false;
+
+        const cleanup = () => {
+            clearTimeout(timeoutId);
+            if (!isResolved) {
+                socket.destroy();
+            }
+        };
+
+        const timeoutId = setTimeout(() => {
+            cleanup();
+            // 更新黑名单
+            const record = blacklist.get(host) || { failCount: 0, lastFail: 0 };
+            record.failCount++;
+            record.lastFail = Date.now();
+            blacklist.set(host, record);
+            
+            reject(new Error('Connection timeout'));
+        }, 5000);
+
+        socket.once('connect', () => {
+            isResolved = true;
+            cleanup();
+            socket.setTimeout(0);
             resolve(socket);
         });
 
-        socket.on('timeout', () => {
-            socket.destroy();
-            reject(new Error('Connection timeout'));
-        });
-
-        socket.on('error', (err) => {
+        socket.once('error', (err) => {
+            cleanup();
+            // 更新黑名单
+            const record = blacklist.get(host) || { failCount: 0, lastFail: 0 };
+            record.failCount++;
+            record.lastFail = Date.now();
+            blacklist.set(host, record);
+            
             reject(err);
         });
     });
@@ -302,13 +359,20 @@ export const handler: Handler = async (event, context) => {
                 }
 
                 try {
-                    // 设置更短的连接超时
-                    const socket = await Promise.race([
-                        connectToTarget(vlessHeader.target.host, vlessHeader.target.port),
-                        new Promise((_, reject) => 
-                            setTimeout(() => reject(new Error('Connection timeout')), 5000)
-                        )
-                    ]);
+                    // 检查目标地址是否可连接
+                    if (!checkBlacklist(vlessHeader.target.host)) {
+                        log.warn(`Target ${vlessHeader.target.host} is temporarily blocked`);
+                        return { 
+                            statusCode: 503,
+                            body: 'Service Temporarily Unavailable',
+                            headers: {
+                                ...headers,
+                                'Retry-After': '300'
+                            }
+                        };
+                    }
+
+                    const socket = await connectToTarget(vlessHeader.target.host, vlessHeader.target.port);
 
                     session = {
                         socket,
@@ -331,9 +395,12 @@ export const handler: Handler = async (event, context) => {
                 } catch (err) {
                     log.error('Failed to establish connection:', err.message);
                     return { 
-                        statusCode: 504,
-                        body: 'Gateway Timeout',
-                        headers
+                        statusCode: 503,
+                        body: 'Service Temporarily Unavailable',
+                        headers: {
+                            ...headers,
+                            'Retry-After': '60'
+                        }
                     };
                 }
             }
