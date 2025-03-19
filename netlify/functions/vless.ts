@@ -50,17 +50,56 @@ const blacklist = new Map<string, {
 
 // 修改连接配置
 const CONNECTION_CONFIG = {
-    TIMEOUT: 3000,          // 减少连接超时时间到3秒
-    RETRY_TIMES: 2,         // 添加重试次数
-    RETRY_DELAY: 1000,      // 重试延迟1秒
-    BAN_TIME: 60000,        // 保持封禁时间1分钟
-    MAX_FAIL_COUNT: 3,      // 保持最大失败次数
-    WHITELIST: [            // 扩展白名单
-        '1.187.2.14',
-        'localhost',
-        '127.0.0.1'
-    ]
+    TIMEOUT: 2000,          // 连接超时改为2秒
+    RETRY_TIMES: 1,         // 只重试一次
+    RETRY_DELAY: 500,       // 重试延迟改为0.5秒
+    BAN_TIME: 30000,        // 封禁时间改为30秒
+    MAX_FAIL_COUNT: 3,
+    WHITELIST: ['1.187.2.14', 'localhost', '127.0.0.1']
 };
+
+// 优化会话管理
+class SessionManager {
+    private static instance: SessionManager;
+    private sessions: Map<string, any>;
+    private cleanupInterval: NodeJS.Timeout;
+
+    private constructor() {
+        this.sessions = new Map();
+        this.cleanupInterval = setInterval(() => this.cleanup(), 5000);
+    }
+
+    static getInstance() {
+        if (!SessionManager.instance) {
+            SessionManager.instance = new SessionManager();
+        }
+        return SessionManager.instance;
+    }
+
+    get(uuid: string) {
+        return this.sessions.get(uuid);
+    }
+
+    set(uuid: string, session: any) {
+        this.sessions.set(uuid, session);
+    }
+
+    delete(uuid: string) {
+        this.sessions.delete(uuid);
+    }
+
+    private cleanup() {
+        const now = Date.now();
+        for (const [id, session] of this.sessions.entries()) {
+            if (now - session.lastActive > CONFIG.SESSION_TIMEOUT) {
+                session.socket?.destroy();
+                this.sessions.delete(id);
+            }
+        }
+    }
+}
+
+const sessionManager = SessionManager.getInstance();
 
 // 优化黑名单管理
 function checkBlacklist(host: string): boolean {
@@ -225,26 +264,58 @@ function validateUUID(test: Uint8Array, against: string): boolean {
     return true;
 }
 
-// 添加重试逻辑的连接函数
+// 改进连接函数
 async function connectToTarget(host: string, port: number): Promise<net.Socket> {
     let lastError;
     
-    for (let i = 0; i <= CONNECTION_CONFIG.RETRY_TIMES; i++) {
-        if (i > 0) {
-            log.info(`Retry attempt ${i} for ${host}:${port}`);
-            await new Promise(r => setTimeout(r, CONNECTION_CONFIG.RETRY_DELAY));
-        }
+    // 添加快速失败检测
+    if (!checkBlacklist(host)) {
+        const record = blacklist.get(host);
+        const remainingTime = Math.ceil((CONNECTION_CONFIG.BAN_TIME - (Date.now() - record!.lastFail)) / 1000);
+        throw new Error(`Target blocked for ${remainingTime} seconds`);
+    }
 
+    for (let i = 0; i <= CONNECTION_CONFIG.RETRY_TIMES; i++) {
         try {
-            const socket = await connectWithTimeout(host, port);
-            if (i > 0) {
-                log.info(`Successful connection after ${i} retries`);
-            }
+            // 使用AbortController来实现快速超时
+            const abortController = new AbortController();
+            const timeoutId = setTimeout(() => abortController.abort(), CONNECTION_CONFIG.TIMEOUT);
+
+            const socket = await new Promise<net.Socket>((resolve, reject) => {
+                const socket = net.createConnection({
+                    host: host,
+                    port: port
+                });
+
+                socket.once('connect', () => {
+                    clearTimeout(timeoutId);
+                    socket.setTimeout(CONNECTION_CONFIG.TIMEOUT);
+                    resolve(socket);
+                });
+
+                socket.once('error', (err) => {
+                    clearTimeout(timeoutId);
+                    reject(err);
+                });
+
+                abortController.signal.addEventListener('abort', () => {
+                    socket.destroy();
+                    reject(new Error('Connection timeout'));
+                });
+            });
+
+            // 连接成功，重置黑名单
+            blacklist.delete(host);
             return socket;
+
         } catch (err) {
             lastError = err;
-            log.warn(`Connection attempt ${i + 1} failed:`, err.message);
-            continue;
+            updateBlacklist(host);
+            
+            if (i < CONNECTION_CONFIG.RETRY_TIMES) {
+                log.info(`Retry attempt ${i + 1} for ${host}:${port}`);
+                await new Promise(r => setTimeout(r, CONNECTION_CONFIG.RETRY_DELAY));
+            }
         }
     }
     
@@ -373,7 +444,7 @@ export const handler: Handler = async (event, context) => {
         // GET请求处理
         if (httpMethod === 'GET' && !seq) {
             log.info('Processing GET request for UUID:', uuid);
-            const session = sessions.get(uuid);
+            const session = sessionManager.get(uuid);
             
             if (!session?.socket || !session.target) {
                 log.warn('Session not found for GET request');
@@ -410,7 +481,7 @@ export const handler: Handler = async (event, context) => {
         // POST请求处理
         if (httpMethod === 'POST' && seq !== null && body) {
             log.info('Processing POST request:', { uuid, seq });
-            let session = sessions.get(uuid);
+            let session = sessionManager.get(uuid);
 
             const data = Buffer.from(body, 'base64');
             log.debug('POST data size:', data.length);
@@ -461,7 +532,7 @@ export const handler: Handler = async (event, context) => {
                         lastActive: Date.now()
                     };
 
-                    sessions.set(uuid, session);
+                    sessionManager.set(uuid, session);
                     log.info('New session created:', { uuid, target: vlessHeader.target });
 
                     if (vlessHeader.resp) {
@@ -499,7 +570,7 @@ export const handler: Handler = async (event, context) => {
             if (session.pendingBuffers.size > CONFIG.MAX_BUFFERED_POSTS) {
                 log.warn('Too many buffered posts:', session.pendingBuffers.size);
                 session.socket?.destroy();
-                sessions.delete(uuid);
+                sessionManager.delete(uuid);
                 return { statusCode: 429 };
             }
 
