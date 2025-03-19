@@ -240,18 +240,18 @@ export const handler = async (request: Request, context: Context) => {
         log('info', `Request method: ${request.method}`);
         log('info', `Request path: ${new URL(request.url).pathname}`);
         
-        const pathMatch = new URL(request.url).pathname.match(/\/([^/]+)(?:/([0-9]+))?$/);
+        // 修改正则表达式匹配
+        const pathMatch = request.url.split('/').filter(Boolean);
+        const uuid = pathMatch[pathMatch.length - 2];  // 倒数第二个片段为 uuid
+        const seq = pathMatch[pathMatch.length - 1];   // 最后一个片段为 seq (如果存在)
         
-        if (!pathMatch) {
+        if (!uuid) {
             log('warn', 'Invalid path format');
             return new Response('Not Found', { status: 404 });
         }
 
-        const uuid = pathMatch[1];
-        const seq = pathMatch[2] ? parseInt(pathMatch[2]) : null;
-        
         log('debug', `UUID: ${uuid}, Sequence: ${seq}`);
-
+        
         // GET 请求处理下行流
         if (request.method === 'GET' && !seq) {
             log('info', `Creating new downstream for session ${uuid}`);
@@ -266,8 +266,12 @@ export const handler = async (request: Request, context: Context) => {
         }
         
         // POST 请求处理上行数据
-        if (request.method === 'POST' && seq !== null) {
-            log('info', `Processing packet seq=${seq} for session ${uuid}`);
+        if (request.method === 'POST' && seq) {
+            const seqNum = parseInt(seq);
+            if (isNaN(seqNum)) {
+                return new Response('Bad Request', { status: 400 });
+            }
+            log('info', `Processing packet seq=${seqNum} for session ${uuid}`);
             let session = sessions.get(uuid);
             if (!session) {
                 session = new Session(uuid);
@@ -277,7 +281,7 @@ export const handler = async (request: Request, context: Context) => {
             try {
                 const buffer = await request.arrayBuffer();
                 log('debug', `Received packet size: ${buffer.byteLength}`);
-                await session.processPacket(seq, new Uint8Array(buffer));
+                await session.processPacket(seqNum, new Uint8Array(buffer));
                 return new Response('OK', { status: 200, headers });
             } catch (err) {
                 log('error', `Failed to process packet: ${err.message}`);
