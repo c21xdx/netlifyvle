@@ -20,85 +20,102 @@ function log(type: string, ...args: any[]) {
 
 // VLESS 协议解析相关功能
 function parseUUID(uuid: string): Uint8Array {
-    uuid = uuid.replaceAll('-', '');
-    const r: number[] = [];
-    for (let i = 0; i < 16; i++) {
-        r.push(parseInt(uuid.substr(i * 2, 2), 16));
+    // 移除所有非十六进制字符
+    const cleanUUID = uuid.replace(/[^0-9a-fA-F]/g, '');
+    if (cleanUUID.length !== 32) {
+        throw new Error('Invalid UUID format');
     }
-    return new Uint8Array(r);
+    
+    const r = new Uint8Array(16);
+    for (let i = 0; i < 16; i++) {
+        r[i] = parseInt(cleanUUID.slice(i * 2, (i + 1) * 2), 16);
+    }
+    return r;
 }
 
 function validateUUID(left: Uint8Array, right: Uint8Array): boolean {
-    for (let i = 0; i < 16; i++) {
-        if (left[i] !== right[i]) return false;
+    if (left.length !== 16 || right.length !== 16) {
+        return false;
     }
-    return true;
+    try {
+        return left.every((val, idx) => val === right[idx]);
+    } catch (err) {
+        log('error', 'UUID validation error:', err);
+        return false;
+    }
 }
 
 async function readVlessHeader(chunk: Uint8Array, uuid: string) {
-    // 直接使用传入的数据而不是stream
-    const header = chunk;
-    
-    if (header.length < 18) {
-        throw new Error('Insufficient data');
+    try {
+        // 确保数据长度足够
+        if (chunk.length < 18) {
+            throw new Error('Insufficient data length');
+        }
+
+        const version = chunk[0];
+        const uuidBytes = chunk.slice(1, 17);
+        log('debug', `Parsing UUID: ${uuid}`);
+        const requestUuid = parseUUID(uuid);
+        
+        if (!validateUUID(uuidBytes, requestUuid)) {
+            log('error', 'UUID validation failed');
+            log('debug', 'Expected:', Array.from(requestUuid));
+            log('debug', 'Received:', Array.from(uuidBytes));
+            throw new Error('Invalid UUID');
+        }
+
+        const addonsLength = chunk[17];
+        const command = chunk[18 + addonsLength];
+        
+        if (command !== 1) { // 1 = TCP
+            throw new Error(`Unsupported command: ${command}`);
+        }
+
+        // 读取地址信息
+        const portIndex = 18 + addonsLength + 2;
+        const portBytes = chunk.slice(portIndex, portIndex + 2);
+        const port = (portBytes[0] << 8) | portBytes[1];
+        
+        const addressType = chunk[portIndex + 2];
+        let address = '';
+        let headerEnd = 0;
+
+        switch (addressType) {
+            case 1: // IPv4
+                const ipv4Bytes = chunk.slice(portIndex + 3, portIndex + 7);
+                address = Array.from(ipv4Bytes).join('.');
+                headerEnd = portIndex + 7;
+                break;
+            case 2: // Domain
+                const domainLen = chunk[portIndex + 3];
+                const domain = new TextDecoder().decode(
+                    chunk.slice(portIndex + 4, portIndex + 4 + domainLen)
+                );
+                address = domain;
+                headerEnd = portIndex + 4 + domainLen;
+                break;
+            case 3: // IPv6
+                const ipv6Bytes = chunk.slice(portIndex + 3, portIndex + 19);
+                address = Array.from(ipv6Bytes)
+                    .map(b => b.toString(16).padStart(2, '0'))
+                    .join(':');
+                headerEnd = portIndex + 19;
+                break;
+            default:
+                throw new Error(`Unsupported address type: ${addressType}`);
+        }
+
+        return {
+            version,
+            addr: address,
+            port,
+            rawHeader: chunk.slice(0, headerEnd),
+            rawDataIndex: headerEnd,
+        };
+    } catch (err) {
+        log('error', `VLESS header parse error: ${err.message}`);
+        throw err;
     }
-
-    const version = header[0];
-    const uuidBytes = header.slice(1, 17);
-    const requestUuid = parseUUID(uuid);
-    
-    if (!validateUUID(uuidBytes, requestUuid)) {
-        throw new Error('Invalid UUID');
-    }
-
-    const addonsLength = header[17];
-    const command = header[18 + addonsLength];
-    
-    if (command !== 1) { // 1 = TCP
-        throw new Error(`Unsupported command: ${command}`);
-    }
-
-    // 读取地址信息
-    const portIndex = 18 + addonsLength + 2;
-    const portBytes = header.slice(portIndex, portIndex + 2);
-    const port = (portBytes[0] << 8) | portBytes[1];
-    
-    const addressType = header[portIndex + 2];
-    let address = '';
-    let headerEnd = 0;
-
-    switch (addressType) {
-        case 1: // IPv4
-            const ipv4Bytes = header.slice(portIndex + 3, portIndex + 7);
-            address = Array.from(ipv4Bytes).join('.');
-            headerEnd = portIndex + 7;
-            break;
-        case 2: // Domain
-            const domainLen = header[portIndex + 3];
-            const domain = new TextDecoder().decode(
-                header.slice(portIndex + 4, portIndex + 4 + domainLen)
-            );
-            address = domain;
-            headerEnd = portIndex + 4 + domainLen;
-            break;
-        case 3: // IPv6
-            const ipv6Bytes = header.slice(portIndex + 3, portIndex + 19);
-            address = Array.from(ipv6Bytes)
-                .map(b => b.toString(16).padStart(2, '0'))
-                .join(':');
-            headerEnd = portIndex + 19;
-            break;
-        default:
-            throw new Error(`Unsupported address type: ${addressType}`);
-    }
-
-    return {
-        version,
-        addr: address,
-        port,
-        rawHeader: header.slice(0, headerEnd),
-        rawDataIndex: headerEnd,
-    };
 }
 
 class VlessSession {
