@@ -35,37 +35,13 @@ function validateUUID(left: Uint8Array, right: Uint8Array): boolean {
     return true;
 }
 
-async function readVlessHeader(reader: ReadableStreamDefaultReader<Uint8Array>, uuid: string) {
-    let readLen = 0;
-    let header = new Uint8Array();
-
-    async function readAtLeast(n: number): Promise<{ done: boolean; value: Uint8Array }> {
-        const chunks: Uint8Array[] = [];
-        let bytesRead = 0;
-        while (bytesRead < n) {
-            const { value, done } = await reader.read();
-            if (done) break;
-            chunks.push(value);
-            bytesRead += value.length;
-        }
-        
-        if (bytesRead < n) {
-            throw new Error('Insufficient data');
-        }
-
-        const merged = new Uint8Array(bytesRead);
-        let offset = 0;
-        for (const chunk of chunks) {
-            merged.set(chunk, offset);
-            offset += chunk.length;
-        }
-        return { value: merged, done: false };
+async function readVlessHeader(chunk: Uint8Array, uuid: string) {
+    // 直接使用传入的数据而不是stream
+    const header = chunk;
+    
+    if (header.length < 18) {
+        throw new Error('Insufficient data');
     }
-
-    // 读取前18字节 (version + uuid + addons)
-    const { value: vlessHeader } = await readAtLeast(18);
-    header = vlessHeader;
-    readLen = header.length;
 
     const version = header[0];
     const uuidBytes = header.slice(1, 17);
@@ -75,7 +51,6 @@ async function readVlessHeader(reader: ReadableStreamDefaultReader<Uint8Array>, 
         throw new Error('Invalid UUID');
     }
 
-    // 解析协议头
     const addonsLength = header[17];
     const command = header[18 + addonsLength];
     
@@ -141,27 +116,33 @@ class VlessSession {
     }
 
     async processInbound(seq: number, chunk: Uint8Array): Promise<void> {
-        if (!this.initialized && seq === 0) {
-            // 处理第一个数据包，解析 VLESS 头
-            const streamReader = chunk.stream().getReader();
-            const vlessHeader = await readVlessHeader(streamReader, SETTINGS.UUID);
-            
-            // 保存 VLESS 响应头用于下行连接
-            this.vlessResponseHeader = new Uint8Array([vlessHeader.version, 0]);
-            
-            // 这里应该建立到目标地址的连接
-            log('info', `VLESS target: ${vlessHeader.addr}:${vlessHeader.port}`);
-            this.initialized = true;
-            
-            // 处理剩余数据
-            const writer = this.remoteConnection.writable.getWriter();
-            await writer.write(chunk.slice(vlessHeader.rawDataIndex));
-            writer.releaseLock();
-        } else {
-            // 后续数据包直接转发
-            const writer = this.remoteConnection.writable.getWriter();
-            await writer.write(chunk);
-            writer.releaseLock();
+        try {
+            if (!this.initialized && seq === 0) {
+                // 直接解析 VLESS 头部
+                const vlessHeader = await readVlessHeader(chunk, SETTINGS.UUID);
+                
+                // 保存 VLESS 响应头用于下行连接
+                this.vlessResponseHeader = new Uint8Array([vlessHeader.version, 0]);
+                
+                log('info', `VLESS target: ${vlessHeader.addr}:${vlessHeader.port}`);
+                this.initialized = true;
+                
+                // 处理剩余数据
+                const remainingData = chunk.slice(vlessHeader.rawDataIndex);
+                if (remainingData.length > 0) {
+                    const writer = this.remoteConnection.writable.getWriter();
+                    await writer.write(remainingData);
+                    writer.releaseLock();
+                }
+            } else {
+                // 后续数据包直接转发
+                const writer = this.remoteConnection.writable.getWriter();
+                await writer.write(chunk);
+                writer.releaseLock();
+            }
+        } catch (err) {
+            log('error', `Process inbound error: ${err.message}`);
+            throw err;
         }
     }
 
