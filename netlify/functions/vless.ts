@@ -226,6 +226,8 @@ class Session {
 
 // 处理函数
 export const handler = async (request: Request, context: Context) => {
+    log('debug', `Received ${request.method} request to ${request.url}`);
+    
     const headers = {
         'Access-Control-Allow-Origin': '*',
         'Access-Control-Allow-Methods': 'GET, POST',
@@ -234,19 +236,25 @@ export const handler = async (request: Request, context: Context) => {
     };
 
     try {
-        // 使用 event 参数获取路径信息
-        const pathname = context.path || request.path || '/';
-        const pathMatch = pathname.match(new RegExp(`${SETTINGS.XHTTP_PATH}/([^/]+)(?:/([0-9]+))?$`));
+        // 打印请求信息
+        log('info', `Request method: ${request.method}`);
+        log('info', `Request path: ${new URL(request.url).pathname}`);
+        
+        const pathMatch = new URL(request.url).pathname.match(/\/([^/]+)(?:/([0-9]+))?$/);
         
         if (!pathMatch) {
+            log('warn', 'Invalid path format');
             return new Response('Not Found', { status: 404 });
         }
 
         const uuid = pathMatch[1];
         const seq = pathMatch[2] ? parseInt(pathMatch[2]) : null;
+        
+        log('debug', `UUID: ${uuid}, Sequence: ${seq}`);
 
         // GET 请求处理下行流
         if (request.method === 'GET' && !seq) {
+            log('info', `Creating new downstream for session ${uuid}`);
             let session = sessions.get(uuid);
             if (!session) {
                 session = new Session(uuid);
@@ -259,6 +267,7 @@ export const handler = async (request: Request, context: Context) => {
         
         // POST 请求处理上行数据
         if (request.method === 'POST' && seq !== null) {
+            log('info', `Processing packet seq=${seq} for session ${uuid}`);
             let session = sessions.get(uuid);
             if (!session) {
                 session = new Session(uuid);
@@ -267,18 +276,22 @@ export const handler = async (request: Request, context: Context) => {
 
             try {
                 const buffer = await request.arrayBuffer();
+                log('debug', `Received packet size: ${buffer.byteLength}`);
                 await session.processPacket(seq, new Uint8Array(buffer));
                 return new Response('OK', { status: 200, headers });
             } catch (err) {
+                log('error', `Failed to process packet: ${err.message}`);
                 session.cleanup();
                 sessions.delete(uuid);
                 return new Response('Internal Server Error', { status: 500 });
             }
         }
 
+        log('warn', 'Request did not match any handler');
         return new Response('Not Found', { status: 404 });
     } catch (err) {
-        console.error('Handler error:', err);
+        log('error', `Handler error: ${err.message}`);
+        log('error', err.stack || 'No stack trace available');
         return new Response('Internal Server Error', { 
             status: 500,
             headers: {
@@ -286,8 +299,4 @@ export const handler = async (request: Request, context: Context) => {
             }
         });
     }
-};
-
-export const config = {
-    path: "/vless/*"
 };
