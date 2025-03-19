@@ -23,7 +23,7 @@ const log = {
     error: (...args: any[]) => console.log('[ERROR]', ...args)
 };
 
-// 会话存储
+// 使用内存存储会话
 const sessions = new Map<string, {
     nextSeq: number;
     target?: { host: string; port: number };
@@ -214,7 +214,7 @@ export default async function handler(request: Request): Promise<Response> {
     // GET 请求处理下行数据
     if (request.method === 'GET' && !seq) {
         log.info('Processing GET request for UUID:', uuid);
-        const session = sessions.get(uuid);
+        const session = sessions.get(uuid);  // 直接从Map获取
         if (!session?.target) {
             log.warn('Session not found for GET request');
             return new Response('Session not found', { status: 404 });
@@ -240,7 +240,7 @@ export default async function handler(request: Request): Promise<Response> {
     // POST 请求处理上行数据
     if (request.method === 'POST' && seq !== null) {
         log.info('Processing POST request:', { uuid, seq });
-        let session = sessions.get(uuid);
+        let session = sessions.get(uuid);  // 直接从Map获取
         
         const size = parseInt(request.headers.get('content-length') || '0');
         log.debug('POST data size:', size);
@@ -268,22 +268,25 @@ export default async function handler(request: Request): Promise<Response> {
             session = {
                 nextSeq: 0,
                 target: parsed.target,
-                pendingBuffers: new Map(),
+                pendingBuffers: new Map(),  // 使用Map而不是对象
                 lastActive: Date.now()
             };
-            sessions.set(uuid, session);
+            sessions.set(uuid, session);  // 直接存储到Map
             log.info('New session created:', { uuid, target: parsed.target });
         }
 
         session.lastActive = Date.now();
-        session.pendingBuffers.set(seq, data);
+        session.pendingBuffers.set(seq, data);  // 直接存储二进制数据
         log.debug('Stored packet:', { seq, size: data.length });
 
         if (session.pendingBuffers.size > CONFIG.MAX_BUFFERED_POSTS) {
             log.warn('Too many buffered posts:', session.pendingBuffers.size);
-            sessions.delete(uuid);
+            sessions.delete(uuid);  // 直接从Map删除
             return new Response('Too many buffered posts', { status: 429 });
         }
+
+        // 更新会话
+        sessions.set(uuid, session);
 
         // 处理已排序的数据包
         let processed = 0;
@@ -298,7 +301,7 @@ export default async function handler(request: Request): Promise<Response> {
                 const parsed = await parseVLESSHeader(buffer);
                 if (!parsed.isValid || !parsed.target) {
                     log.error('Invalid VLESS header in first packet');
-                    sessions.delete(uuid);
+                    sessions.delete(uuid);  // 直接从Map删除
                     return new Response('Invalid VLESS header', { status: 400 });
                 }
             }
