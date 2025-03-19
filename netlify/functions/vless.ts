@@ -48,27 +48,50 @@ const blacklist = new Map<string, {
     lastFail: number;
 }>();
 
-// 添加黑名单检查和清理函数
+// 修改黑名单相关配置
+const CONNECTION_CONFIG = {
+    TIMEOUT: 5000,          // 连接超时时间
+    BAN_TIME: 60000,        // 基础封禁时间（1分钟）
+    MAX_FAIL_COUNT: 3,      // 最大失败次数
+    WHITELIST: [            // 白名单
+        '1.187.2.14',       // 添加你的目标服务器
+        'localhost',
+        '127.0.0.1'
+    ]
+};
+
+// 优化黑名单管理
 function checkBlacklist(host: string): boolean {
+    // 白名单直接通过
+    if (CONNECTION_CONFIG.WHITELIST.includes(host)) {
+        return true;
+    }
+
     const now = Date.now();
     const record = blacklist.get(host);
     
     // 清理过期黑名单
     for (const [h, r] of blacklist.entries()) {
-        if (now - r.lastFail > 300000) { // 5分钟后重置
+        if (now - r.lastFail > CONNECTION_CONFIG.BAN_TIME * 2) {
             blacklist.delete(h);
         }
     }
     
     if (!record) return true;
     
-    // 失败次数越多，封禁时间越长
-    const banTime = Math.min(record.failCount * 60000, 300000); // 最长5分钟
-    if (now - record.lastFail < banTime) {
-        return false;
+    // 失败次数未超过限制
+    if (record.failCount < CONNECTION_CONFIG.MAX_FAIL_COUNT) {
+        return true;
     }
     
-    return true;
+    // 检查是否已过封禁时间
+    if (now - record.lastFail > CONNECTION_CONFIG.BAN_TIME) {
+        // 重置失败计数
+        record.failCount = 0;
+        return true;
+    }
+    
+    return false;
 }
 
 function randomPadding(): string {
@@ -200,17 +223,20 @@ function validateUUID(test: Uint8Array, against: string): boolean {
     return true;
 }
 
-// 修改连接超时设置
+// 修改连接处理函数
 async function connectToTarget(host: string, port: number): Promise<net.Socket> {
+    // 检查黑名单状态
     if (!checkBlacklist(host)) {
-        throw new Error('Target temporarily blocked due to connection failures');
+        const record = blacklist.get(host);
+        const remainingTime = Math.ceil((CONNECTION_CONFIG.BAN_TIME - (Date.now() - record!.lastFail)) / 1000);
+        throw new Error(`Target blocked for ${remainingTime} seconds`);
     }
 
     return new Promise((resolve, reject) => {
         const socket = net.createConnection({
             host: host,
             port: port,
-            timeout: 5000
+            timeout: CONNECTION_CONFIG.TIMEOUT
         });
 
         let isResolved = false;
@@ -224,33 +250,44 @@ async function connectToTarget(host: string, port: number): Promise<net.Socket> 
 
         const timeoutId = setTimeout(() => {
             cleanup();
-            // 更新黑名单
-            const record = blacklist.get(host) || { failCount: 0, lastFail: 0 };
-            record.failCount++;
-            record.lastFail = Date.now();
-            blacklist.set(host, record);
-            
+            updateBlacklist(host);
             reject(new Error('Connection timeout'));
-        }, 5000);
+        }, CONNECTION_CONFIG.TIMEOUT);
 
         socket.once('connect', () => {
             isResolved = true;
             cleanup();
             socket.setTimeout(0);
+            
+            // 连接成功，重置失败计数
+            if (blacklist.has(host)) {
+                blacklist.delete(host);
+            }
+            
             resolve(socket);
         });
 
         socket.once('error', (err) => {
             cleanup();
-            // 更新黑名单
-            const record = blacklist.get(host) || { failCount: 0, lastFail: 0 };
-            record.failCount++;
-            record.lastFail = Date.now();
-            blacklist.set(host, record);
-            
+            updateBlacklist(host);
             reject(err);
         });
     });
+}
+
+// 添加黑名单更新函数
+function updateBlacklist(host: string): void {
+    // 白名单主机不加入黑名单
+    if (CONNECTION_CONFIG.WHITELIST.includes(host)) {
+        return;
+    }
+
+    const record = blacklist.get(host) || { failCount: 0, lastFail: 0 };
+    record.failCount++;
+    record.lastFail = Date.now();
+    blacklist.set(host, record);
+    
+    log.warn(`Updated blacklist for ${host}: fail count = ${record.failCount}`);
 }
 
 export const handler: Handler = async (event, context) => {
@@ -361,13 +398,15 @@ export const handler: Handler = async (event, context) => {
                 try {
                     // 检查目标地址是否可连接
                     if (!checkBlacklist(vlessHeader.target.host)) {
-                        log.warn(`Target ${vlessHeader.target.host} is temporarily blocked`);
+                        const record = blacklist.get(vlessHeader.target.host);
+                        const remainingTime = Math.ceil((CONNECTION_CONFIG.BAN_TIME - (Date.now() - record!.lastFail)) / 1000);
+                        log.warn(`Target ${vlessHeader.target.host} is blocked for ${remainingTime} seconds`);
                         return { 
                             statusCode: 503,
-                            body: 'Service Temporarily Unavailable',
+                            body: `Service Temporarily Unavailable (${remainingTime}s)`,
                             headers: {
                                 ...headers,
-                                'Retry-After': '300'
+                                'Retry-After': remainingTime.toString()
                             }
                         };
                     }
@@ -396,10 +435,10 @@ export const handler: Handler = async (event, context) => {
                     log.error('Failed to establish connection:', err.message);
                     return { 
                         statusCode: 503,
-                        body: 'Service Temporarily Unavailable',
+                        body: err.message,
                         headers: {
                             ...headers,
-                            'Retry-After': '60'
+                            'Retry-After': '10'
                         }
                     };
                 }
