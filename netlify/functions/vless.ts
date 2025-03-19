@@ -234,24 +234,22 @@ export const handler = async (event: any) => {
     };
 
     try {
-        // 直接从 event 获取信息
         const method = event.httpMethod || event.method || 'GET';
         const path = event.path || event.rawPath || '/';
         
-        log('debug', `Processing ${method} request on path: ${path}`);
-
-        // 简化的路径解析
-        const pathParts = path.split('/').filter(Boolean);
-        const uuid = pathParts[pathParts.length - 2];
-        const seqStr = pathParts[pathParts.length - 1];
-        const seq = seqStr ? parseInt(seqStr) : null;
-
-        if (!uuid) {
-            log('warn', 'Missing UUID in path');
+        // 修正路径解析逻辑
+        const pathRegex = new RegExp(`${SETTINGS.XHTTP_PATH}/([^/]+)(?:/([0-9]+))?$`);
+        const match = path.match(pathRegex);
+        
+        if (!match) {
+            log('warn', `Invalid path format: ${path}`);
             return new Response('Not Found', { status: 404 });
         }
 
-        log('debug', `UUID: ${uuid}, Sequence: ${seq}`);
+        const [, uuid, seqStr] = match;
+        const seq = seqStr ? parseInt(seqStr) : null;
+
+        log('debug', `Parsed request - Method: ${method}, UUID: ${uuid}, Sequence: ${seq}`);
 
         // GET 请求处理
         if (method === 'GET') {
@@ -276,17 +274,16 @@ export const handler = async (event: any) => {
             }
 
             try {
-                const body = event.body || event.rawBody;
+                const body = await event.arrayBuffer();
                 if (!body) {
                     throw new Error('Missing request body');
                 }
                 
-                const buffer = typeof body === 'string' 
-                    ? new TextEncoder().encode(body)
-                    : new Uint8Array(body);
-                
+                const buffer = new Uint8Array(body);
                 log('debug', `Received packet size: ${buffer.byteLength}`);
-                await session.processPacket(seq, buffer);
+                
+                // 调用 vlessSession 处理数据
+                await session.vlessSession.processInbound(seq, buffer);
                 return new Response('OK', { status: 200, headers });
             } catch (err) {
                 log('error', `Failed to process packet: ${err.message}`);
@@ -296,10 +293,9 @@ export const handler = async (event: any) => {
             }
         }
 
-        log('warn', 'Request did not match any handler');
         return new Response('Not Found', { status: 404 });
     } catch (err) {
-        log('error', `Handler error details:`, err);
+        log('error', `Handler error:`, err);
         return new Response('Internal Server Error', { 
             status: 500,
             headers: {
