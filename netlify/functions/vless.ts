@@ -1,3 +1,6 @@
+import { Handler } from '@netlify/functions'
+import net from 'net'
+
 interface VLESSConfig {
     UUID: string;
     XHTTP_PATH: string;
@@ -6,7 +9,6 @@ interface VLESSConfig {
     SESSION_TIMEOUT: number;
 }
 
-// 基础配置
 const CONFIG: VLESSConfig = {
     UUID: '0cf85927-2c71-4e87-9df3-b1eb7d5a9e1b',
     XHTTP_PATH: '/xblog',
@@ -15,7 +17,6 @@ const CONFIG: VLESSConfig = {
     SESSION_TIMEOUT: 30000,
 };
 
-// 添加日志工具函数在配置后面
 const log = {
     debug: (...args: any[]) => console.log('[DEBUG]', ...args),
     info: (...args: any[]) => console.log('[INFO]', ...args),
@@ -23,15 +24,6 @@ const log = {
     error: (...args: any[]) => console.log('[ERROR]', ...args)
 };
 
-// 使用内存存储会话
-const sessions = new Map<string, {
-    nextSeq: number;
-    target?: { host: string; port: number };
-    pendingBuffers: Map<number, Uint8Array>;
-    lastActive: number;
-}>();
-
-// VLESS 协议常量
 const VLESS = {
     VERSION: new Uint8Array([0]),
     ADDR_TYPE: {
@@ -41,58 +33,48 @@ const VLESS = {
     }
 };
 
-// 工具函数
-function makeHeaders(addChunked = false): HeadersInit {
-    const headers = {
-        'Access-Control-Allow-Origin': '*',
-        'Access-Control-Allow-Methods': 'GET, POST',
-        'Cache-Control': 'no-store',
-        'X-Accel-Buffering': 'no',
-        'X-Padding': randomPadding(),
-    };
-    
-    if (addChunked) {
-        headers['Content-Type'] = 'text/event-stream';
-        headers['Transfer-Encoding'] = 'chunked';
-    }
-    
-    return headers;
-}
+// 会话存储
+const sessions = new Map<string, {
+    socket?: net.Socket;
+    nextSeq: number;
+    target?: { host: string; port: number };
+    pendingBuffers: Map<number, Buffer>;
+    lastActive: number;
+}>();
 
 function randomPadding(): string {
     const len = 100 + Math.floor(Math.random() * 900);
     return 'X'.repeat(len);
 }
 
-// VLESS 协议解析
-async function parseVLESSHeader(data: Uint8Array): Promise<{
+async function parseVLESSHeader(data: Buffer): Promise<{
     isValid: boolean;
     target?: { host: string; port: number };
-    remainData?: Uint8Array;
+    remainData?: Buffer;
+    resp?: Buffer;
 }> {
     try {
         log.debug('Parsing VLESS header, data length:', data.length);
         
-        // 基础长度检查
         if (data.length < 18) {
             log.warn('Header too short:', data.length);
             return { isValid: false };
         }
         
-        // 版本检查 (应该是0)
+        // 版本检查
         if (data[0] !== 0) {
             log.warn('Invalid version:', data[0]);
             return { isValid: false };
         }
 
-        // UUID 验证 (1-16字节)
+        // UUID 验证
         const userID = data.slice(1, 17);
         if (!validateUUID(userID, CONFIG.UUID)) {
             log.warn('Invalid UUID');
             return { isValid: false };
         }
 
-        // 跳过附加信息长度字段 (17字节)
+        // 解析附加信息长度
         let pos = 17;
         const addInfoLen = data[pos];
         pos += 1;
@@ -105,7 +87,7 @@ async function parseVLESSHeader(data: Uint8Array): Promise<{
             return { isValid: false };
         }
 
-        // 现在解析地址类型 (应该是1、2或3)
+        // 解析地址类型
         const addType = data[pos];
         pos += 1;
         
@@ -123,7 +105,7 @@ async function parseVLESSHeader(data: Uint8Array): Promise<{
                     log.warn('Header ended unexpectedly in domain');
                     return { isValid: false };
                 }
-                host = new TextDecoder().decode(data.slice(pos, pos + lenDomain));
+                host = data.slice(pos, pos + lenDomain).toString();
                 pos += lenDomain;
                 break;
                 
@@ -161,10 +143,15 @@ async function parseVLESSHeader(data: Uint8Array): Promise<{
         pos += 2;
 
         log.info('Successfully parsed VLESS header:', { host, port });
+        
+        // 构造响应
+        const resp = Buffer.from([0, 0]); // VLESS响应头
+
         return {
             isValid: true,
             target: { host, port },
-            remainData: data.slice(pos)
+            remainData: data.slice(pos),
+            resp
         };
     } catch (err) {
         log.error('Failed to parse VLESS header:', err);
@@ -174,7 +161,7 @@ async function parseVLESSHeader(data: Uint8Array): Promise<{
 
 function validateUUID(test: Uint8Array, against: string): boolean {
     const valid = against.replace(/-/g, '');
-    const bytes = new Uint8Array(16);
+    const bytes = Buffer.alloc(16);
     for (let i = 0; i < 16; i++) {
         bytes[i] = parseInt(valid.substr(i * 2, 2), 16);
     }
@@ -184,15 +171,30 @@ function validateUUID(test: Uint8Array, against: string): boolean {
     return true;
 }
 
-// 主处理函数
-export default async function handler(request: Request): Promise<Response> {
-    const url = new URL(request.url);
-    log.info(`Handling ${request.method} request:`, url.pathname);
+async function connectToTarget(host: string, port: number): Promise<net.Socket> {
+    return new Promise((resolve, reject) => {
+        const socket = net.createConnection({
+            host: host,
+            port: port
+        }, () => {
+            resolve(socket);
+        });
+
+        socket.on('error', (err) => {
+            reject(err);
+        });
+    });
+}
+
+export const handler: Handler = async (event, context) => {
+    const { path, httpMethod, body } = event;
     
-    const match = url.pathname.match(new RegExp(`${CONFIG.XHTTP_PATH}/([^/]+)(?:/([0-9]+))?$`));
+    log.info(`Handling ${httpMethod} request:`, path);
+    
+    const match = path.match(new RegExp(`${CONFIG.XHTTP_PATH}/([^/]+)(?:/([0-9]+))?$`));
     if (!match) {
         log.warn('URL pattern not matched');
-        return new Response('Not Found', { status: 404 });
+        return { statusCode: 404 };
     }
 
     const [_, uuid, seqStr] = match;
@@ -201,8 +203,11 @@ export default async function handler(request: Request): Promise<Response> {
 
     // 清理过期会话
     let cleaned = 0;
-    for (const [id, session] of sessions) {
+    for (const [id, session] of sessions.entries()) {
         if (Date.now() - session.lastActive > CONFIG.SESSION_TIMEOUT) {
+            if (session.socket) {
+                session.socket.destroy();
+            }
             sessions.delete(id);
             cleaned++;
         }
@@ -211,106 +216,154 @@ export default async function handler(request: Request): Promise<Response> {
         log.info(`Cleaned ${cleaned} expired sessions`);
     }
 
-    // GET 请求处理下行数据
-    if (request.method === 'GET' && !seq) {
-        log.info('Processing GET request for UUID:', uuid);
-        const session = sessions.get(uuid);  // 直接从Map获取
-        if (!session?.target) {
-            log.warn('Session not found for GET request');
-            return new Response('Session not found', { status: 404 });
-        }
+    // 通用响应头
+    const headers = {
+        'Access-Control-Allow-Origin': '*',
+        'Access-Control-Allow-Methods': 'GET, POST',
+        'Cache-Control': 'no-store',
+        'X-Accel-Buffering': 'no',
+        'X-Padding': randomPadding(),
+    };
 
-        const targetUrl = `https://${session.target.host}:${session.target.port}`;
-        log.info('Forwarding to:', targetUrl);
-        try {
-            const proxyResp = await fetch(targetUrl, {
-                method: 'GET',
-                headers: makeHeaders(true)
-            });
-            log.info('Proxy response received:', proxyResp.status);
-            return new Response(proxyResp.body, {
-                headers: makeHeaders(true)
-            });
-        } catch (err) {
-            log.error('Proxy request failed:', err);
-            return new Response('Proxy Error', { status: 502 });
-        }
-    }
-
-    // POST 请求处理上行数据
-    if (request.method === 'POST' && seq !== null) {
-        log.info('Processing POST request:', { uuid, seq });
-        let session = sessions.get(uuid);  // 直接从Map获取
-        
-        const size = parseInt(request.headers.get('content-length') || '0');
-        log.debug('POST data size:', size);
-        
-        if (size > CONFIG.MAX_POST_SIZE) {
-            log.warn('Payload too large:', size);
-            return new Response('Payload too large', { status: 413 });
-        }
-
-        const data = new Uint8Array(await request.arrayBuffer());
-
-        if (!session) {
-            if (seq !== 0) {
-                log.warn('Invalid sequence for new session:', seq);
-                return new Response('Invalid sequence', { status: 400 });
-            }
+    try {
+        // GET请求处理
+        if (httpMethod === 'GET' && !seq) {
+            log.info('Processing GET request for UUID:', uuid);
+            const session = sessions.get(uuid);
             
-            log.info('Creating new session');
-            const parsed = await parseVLESSHeader(data);
-            if (!parsed.isValid || !parsed.target) {
-                log.error('Invalid VLESS header for new session');
-                return new Response('Invalid VLESS header', { status: 400 });
+            if (!session?.socket || !session.target) {
+                log.warn('Session not found for GET request');
+                return { statusCode: 404 };
             }
 
-            session = {
-                nextSeq: 0,
-                target: parsed.target,
-                pendingBuffers: new Map(),  // 使用Map而不是对象
-                lastActive: Date.now()
+            // 设置流式响应头
+            headers['Content-Type'] = 'text/event-stream';
+            headers['Transfer-Encoding'] = 'chunked';
+
+            // 创建流式响应
+            const stream = new ReadableStream({
+                start(controller) {
+                    session.socket!.on('data', (chunk) => {
+                        controller.enqueue(chunk);
+                    });
+                    session.socket!.on('end', () => {
+                        controller.close();
+                    });
+                    session.socket!.on('error', (err) => {
+                        controller.error(err);
+                    });
+                }
+            });
+
+            return {
+                statusCode: 200,
+                headers,
+                body: stream,
+                isBase64Encoded: false
             };
-            sessions.set(uuid, session);  // 直接存储到Map
-            log.info('New session created:', { uuid, target: parsed.target });
         }
 
-        session.lastActive = Date.now();
-        session.pendingBuffers.set(seq, data);  // 直接存储二进制数据
-        log.debug('Stored packet:', { seq, size: data.length });
+        // POST请求处理
+        if (httpMethod === 'POST' && seq !== null && body) {
+            log.info('Processing POST request:', { uuid, seq });
+            let session = sessions.get(uuid);
 
-        if (session.pendingBuffers.size > CONFIG.MAX_BUFFERED_POSTS) {
-            log.warn('Too many buffered posts:', session.pendingBuffers.size);
-            sessions.delete(uuid);  // 直接从Map删除
-            return new Response('Too many buffered posts', { status: 429 });
-        }
+            const data = Buffer.from(body, 'base64');
+            log.debug('POST data size:', data.length);
 
-        // 更新会话
-        sessions.set(uuid, session);
+            if (data.length > CONFIG.MAX_POST_SIZE) {
+                log.warn('Payload too large:', data.length);
+                return { statusCode: 413 };
+            }
 
-        // 处理已排序的数据包
-        let processed = 0;
-        while (session.pendingBuffers.has(session.nextSeq)) {
-            const buffer = session.pendingBuffers.get(session.nextSeq)!;
-            session.pendingBuffers.delete(session.nextSeq);
-            session.nextSeq++;
-            processed++;
-            
-            if (session.nextSeq === 1) {
-                log.info('Processing first packet');
-                const parsed = await parseVLESSHeader(buffer);
-                if (!parsed.isValid || !parsed.target) {
-                    log.error('Invalid VLESS header in first packet');
-                    sessions.delete(uuid);  // 直接从Map删除
-                    return new Response('Invalid VLESS header', { status: 400 });
+            // 新会话处理
+            if (!session) {
+                if (seq !== 0) {
+                    log.warn('Invalid sequence for new session:', seq);
+                    return { statusCode: 400 };
+                }
+
+                log.info('Creating new session');
+                const vlessHeader = await parseVLESSHeader(data);
+                
+                if (!vlessHeader.isValid || !vlessHeader.target) {
+                    log.error('Invalid VLESS header for new session');
+                    return { statusCode: 400 };
+                }
+
+                // 创建到目标的连接
+                const socket = await connectToTarget(
+                    vlessHeader.target.host,
+                    vlessHeader.target.port
+                );
+
+                session = {
+                    socket,
+                    nextSeq: 0,
+                    target: vlessHeader.target,
+                    pendingBuffers: new Map(),
+                    lastActive: Date.now()
+                };
+
+                sessions.set(uuid, session);
+                log.info('New session created:', { uuid, target: vlessHeader.target });
+
+                // 写入VLESS响应头
+                if (vlessHeader.resp) {
+                    socket.write(vlessHeader.resp);
+                }
+                
+                // 写入首个数据包的剩余数据
+                if (vlessHeader.remainData) {
+                    socket.write(vlessHeader.remainData);
                 }
             }
+
+            // 更新会话状态
+            session.lastActive = Date.now();
+            session.pendingBuffers.set(seq, data);
+
+            // 检查缓存大小
+            if (session.pendingBuffers.size > CONFIG.MAX_BUFFERED_POSTS) {
+                log.warn('Too many buffered posts:', session.pendingBuffers.size);
+                session.socket?.destroy();
+                sessions.delete(uuid);
+                return { statusCode: 429 };
+            }
+
+            // 按序处理数据包
+            while (session.pendingBuffers.has(session.nextSeq)) {
+                const buffer = session.pendingBuffers.get(session.nextSeq)!;
+                session.pendingBuffers.delete(session.nextSeq);
+                session.socket?.write(buffer);
+                session.nextSeq++;
+            }
+
+            return {
+                statusCode: 200,
+                headers,
+                body: 'OK'
+            };
         }
-        log.debug('Processed packets:', processed);
 
-        return new Response('OK', { headers: makeHeaders() });
+        // OPTIONS请求处理
+        if (httpMethod === 'OPTIONS') {
+            return {
+                statusCode: 204,
+                headers
+            };
+        }
+
+        return { 
+            statusCode: 405,
+            body: 'Method not allowed'
+        };
+
+    } catch (error) {
+        log.error('Handler error:', error);
+        return {
+            statusCode: 500,
+            body: 'Internal server error'
+        };
     }
-
-    log.warn('Method not allowed:', request.method);
-    return new Response('Method not allowed', { status: 405 });
 }
