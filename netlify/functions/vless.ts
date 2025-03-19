@@ -226,8 +226,6 @@ class Session {
 
 // 处理函数
 export const handler = async (request: Request, context: Context) => {
-    log('debug', `Received ${request.method} request`);
-    
     const headers = {
         'Access-Control-Allow-Origin': '*',
         'Access-Control-Allow-Methods': 'GET, POST',
@@ -236,24 +234,32 @@ export const handler = async (request: Request, context: Context) => {
     };
 
     try {
-        // 直接从 request 获取路径
-        const pathname = new URL(request.url).pathname;
-        log('info', `Processing request path: ${pathname}`);
+        // 防护性检查
+        if (!request || !request.method) {
+            throw new Error('Invalid request object');
+        }
         
-        // 提取路径参数
-        const segments = pathname.split('/');
-        const uuid = segments[segments.length - 2];
-        const seq = segments[segments.length - 1];
+        log('debug', `Processing ${request.method} request`);
         
+        // 简单路径解析
+        const path = context.request?.url || context.url || '/';
+        log('info', `Request path: ${path}`);
+        
+        // 简单分割路径并获取参数
+        const parts = path.split('/').filter(Boolean);
+        const uuid = parts[parts.length - 2]; // 倒数第二段为 uuid
+        const seqStr = parts[parts.length - 1]; // 最后一段为序号
+        
+        log('debug', `Path parts: ${parts.join(', ')}`);
+        log('debug', `UUID: ${uuid}, Seq: ${seqStr}`);
+
         if (!uuid) {
             log('warn', 'Missing UUID in path');
             return new Response('Not Found', { status: 404 });
         }
 
-        log('debug', `Processing request for UUID: ${uuid}, sequence: ${seq}`);
-
         // GET 请求处理
-        if (request.method === 'GET' && !seq.match(/^\d+$/)) {
+        if (request.method === 'GET') {
             log('info', `Creating new downstream for session ${uuid}`);
             let session = sessions.get(uuid);
             if (!session) {
@@ -266,8 +272,8 @@ export const handler = async (request: Request, context: Context) => {
         }
         
         // POST 请求处理
-        if (request.method === 'POST' && seq.match(/^\d+$/)) {
-            const seqNum = parseInt(seq);
+        if (request.method === 'POST' && seqStr?.match(/^\d+$/)) {
+            const seqNum = parseInt(seqStr);
             if (isNaN(seqNum)) {
                 return new Response('Bad Request', { status: 400 });
             }
