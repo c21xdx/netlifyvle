@@ -226,7 +226,7 @@ class Session {
 
 // 处理函数
 export const handler = async (request: Request, context: Context) => {
-    log('debug', `Received ${request.method} request to ${request.url}`);
+    log('debug', `Received request: ${context.requestId}`);
     
     const headers = {
         'Access-Control-Allow-Origin': '*',
@@ -236,22 +236,28 @@ export const handler = async (request: Request, context: Context) => {
     };
 
     try {
-        // 打印请求信息
+        // 直接从路径获取参数，避免使用 URL 对象
+        const path = context.request.url || request.url || '/';
+        log('info', `Request path: ${path}`);
         log('info', `Request method: ${request.method}`);
-        log('info', `Request path: ${new URL(request.url).pathname}`);
         
-        // 修改正则表达式匹配
-        const pathMatch = request.url.split('/').filter(Boolean);
-        const uuid = pathMatch[pathMatch.length - 2];  // 倒数第二个片段为 uuid
-        const seq = pathMatch[pathMatch.length - 1];   // 最后一个片段为 seq (如果存在)
-        
-        if (!uuid) {
+        // 从路径中提取参数
+        const parts = path.split('/').filter(Boolean);
+        if (parts.length < 1) {
             log('warn', 'Invalid path format');
             return new Response('Not Found', { status: 404 });
         }
 
-        log('debug', `UUID: ${uuid}, Sequence: ${seq}`);
+        const uuid = parts[parts.length - 2];  // 倒数第二段为 uuid
+        const seq = parts[parts.length - 1];   // 最后一段为序号
         
+        if (!uuid) {
+            log('warn', 'Missing UUID in path');
+            return new Response('Not Found', { status: 404 });
+        }
+
+        log('debug', `Parsed UUID: ${uuid}, Sequence: ${seq}`);
+
         // GET 请求处理下行流
         if (request.method === 'GET' && !seq) {
             log('info', `Creating new downstream for session ${uuid}`);
