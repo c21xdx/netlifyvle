@@ -73,43 +73,90 @@ async function parseVLESSHeader(data: Uint8Array): Promise<{
     try {
         log.debug('Parsing VLESS header, data length:', data.length);
         
+        // 基础长度检查
         if (data.length < 18) {
             log.warn('Header too short:', data.length);
             return { isValid: false };
         }
         
+        // 版本检查 (应该是0)
+        if (data[0] !== 0) {
+            log.warn('Invalid version:', data[0]);
+            return { isValid: false };
+        }
+
+        // UUID 验证 (1-16字节)
         const userID = data.slice(1, 17);
         if (!validateUUID(userID, CONFIG.UUID)) {
             log.warn('Invalid UUID');
             return { isValid: false };
         }
 
-        const addType = data[17];
-        let pos = 18;
-        let host: string;
+        // 跳过附加信息长度字段 (17字节)
+        let pos = 17;
+        const addInfoLen = data[pos];
+        pos += 1;
+        
+        // 跳过附加信息
+        pos += addInfoLen;
+        
+        if (pos >= data.length) {
+            log.warn('Header ended unexpectedly after add info');
+            return { isValid: false };
+        }
+
+        // 现在解析地址类型 (应该是1、2或3)
+        const addType = data[pos];
+        pos += 1;
         
         log.debug('Parsing address type:', addType);
+        let host: string;
         
         switch (addType) {
             case VLESS.ADDR_TYPE.Domain:
+                if (pos >= data.length) {
+                    log.warn('Header ended unexpectedly before domain length');
+                    return { isValid: false };
+                }
                 const lenDomain = data[pos++];
+                if (pos + lenDomain > data.length) {
+                    log.warn('Header ended unexpectedly in domain');
+                    return { isValid: false };
+                }
                 host = new TextDecoder().decode(data.slice(pos, pos + lenDomain));
                 pos += lenDomain;
                 break;
+                
             case VLESS.ADDR_TYPE.IPv4:
+                if (pos + 4 > data.length) {
+                    log.warn('Header ended unexpectedly in IPv4');
+                    return { isValid: false };
+                }
                 host = Array.from(data.slice(pos, pos + 4)).join('.');
                 pos += 4;
                 break;
+                
             case VLESS.ADDR_TYPE.IPv6:
+                if (pos + 16 > data.length) {
+                    log.warn('Header ended unexpectedly in IPv6');
+                    return { isValid: false };
+                }
                 host = Array.from(data.slice(pos, pos + 16))
-                    .map(b => b.toString(16))
+                    .map(b => b.toString(16).padStart(2, '0'))
                     .join(':');
                 pos += 16;
                 break;
+                
             default:
+                log.warn('Invalid address type:', addType);
                 return { isValid: false };
         }
 
+        // 解析端口
+        if (pos + 2 > data.length) {
+            log.warn('Header ended unexpectedly before port');
+            return { isValid: false };
+        }
         const port = (data[pos] << 8) | data[pos + 1];
         pos += 2;
 
