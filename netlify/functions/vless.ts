@@ -68,25 +68,35 @@ async function readVlessHeader(chunk: Uint8Array, uuid: string) {
         }
 
         const version = chunk[0];
-        const receivedUUID = chunk.slice(1, 17);
         log('debug', `Processing VLESS header - version: ${version}`);
-        
-        // Base64 encode UUID for logging
-        const b64ReceivedUUID = btoa(String.fromCharCode(...receivedUUID));
-        log('debug', `Received UUID (base64): ${b64ReceivedUUID}`);
-        
-        const expectedUUID = parseUUID(uuid);
-        const b64ExpectedUUID = btoa(String.fromCharCode(...expectedUUID));
-        log('debug', `Expected UUID (base64): ${b64ExpectedUUID}`);
 
-        if (!validateUUID(receivedUUID, expectedUUID)) {
+        // 修改: 直接使用收到的原始UUID数据
+        const receivedUUID = chunk.slice(1, 17);
+        const expectedUUID = parseUUID(uuid);
+
+        // 打印原始二进制数据以便调试
+        log('debug', 'Raw received UUID:', Array.from(receivedUUID));
+        log('debug', 'Raw expected UUID:', Array.from(expectedUUID));
+        
+        // 直接比较二进制数据
+        if (!receivedUUID.every((byte, i) => byte === expectedUUID[i])) {
+            log('error', 'UUID mismatch');
+            // 打印更详细的比较信息
+            for (let i = 0; i < 16; i++) {
+                if (receivedUUID[i] !== expectedUUID[i]) {
+                    log('debug', `Mismatch at position ${i}: received ${receivedUUID[i]} expected ${expectedUUID[i]}`);
+                }
+            }
             throw new Error('Invalid UUID');
         }
 
         const addonsLength = chunk[17];
-        const command = chunk[18 + addonsLength];
-        
-        if (command !== 1) { // 1 = TCP
+        if (addonsLength !== 0) {
+            log('warn', `Non-zero addons length: ${addonsLength}`);
+        }
+
+        const command = chunk[18];
+        if (command !== 1) {
             throw new Error(`Unsupported command: ${command}`);
         }
 
