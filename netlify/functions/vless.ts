@@ -171,13 +171,23 @@ function validateUUID(test: Uint8Array, against: string): boolean {
     return true;
 }
 
+// 修改连接超时设置
 async function connectToTarget(host: string, port: number): Promise<net.Socket> {
     return new Promise((resolve, reject) => {
         const socket = net.createConnection({
             host: host,
-            port: port
-        }, () => {
+            port: port,
+            timeout: 5000  // 5秒超时
+        });
+
+        socket.on('connect', () => {
+            socket.setTimeout(0);  // 连接成功后取消超时
             resolve(socket);
+        });
+
+        socket.on('timeout', () => {
+            socket.destroy();
+            reject(new Error('Connection timeout'));
         });
 
         socket.on('error', (err) => {
@@ -291,31 +301,40 @@ export const handler: Handler = async (event, context) => {
                     return { statusCode: 400 };
                 }
 
-                // 创建到目标的连接
-                const socket = await connectToTarget(
-                    vlessHeader.target.host,
-                    vlessHeader.target.port
-                );
+                try {
+                    // 设置更短的连接超时
+                    const socket = await Promise.race([
+                        connectToTarget(vlessHeader.target.host, vlessHeader.target.port),
+                        new Promise((_, reject) => 
+                            setTimeout(() => reject(new Error('Connection timeout')), 5000)
+                        )
+                    ]);
 
-                session = {
-                    socket,
-                    nextSeq: 0,
-                    target: vlessHeader.target,
-                    pendingBuffers: new Map(),
-                    lastActive: Date.now()
-                };
+                    session = {
+                        socket,
+                        nextSeq: 0,
+                        target: vlessHeader.target,
+                        pendingBuffers: new Map(),
+                        lastActive: Date.now()
+                    };
 
-                sessions.set(uuid, session);
-                log.info('New session created:', { uuid, target: vlessHeader.target });
+                    sessions.set(uuid, session);
+                    log.info('New session created:', { uuid, target: vlessHeader.target });
 
-                // 写入VLESS响应头
-                if (vlessHeader.resp) {
-                    socket.write(vlessHeader.resp);
-                }
-                
-                // 写入首个数据包的剩余数据
-                if (vlessHeader.remainData) {
-                    socket.write(vlessHeader.remainData);
+                    if (vlessHeader.resp) {
+                        socket.write(vlessHeader.resp);
+                    }
+                    
+                    if (vlessHeader.remainData) {
+                        socket.write(vlessHeader.remainData);
+                    }
+                } catch (err) {
+                    log.error('Failed to establish connection:', err.message);
+                    return { 
+                        statusCode: 504,
+                        body: 'Gateway Timeout',
+                        headers
+                    };
                 }
             }
 
