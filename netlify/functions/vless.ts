@@ -234,8 +234,15 @@ export const handler = async (request: Request, context: Context) => {
     };
 
     try {
-        // 修正 URL 处理
-        const url = new URL(request.url, 'http://' + request.headers.get('host') || 'localhost');
+        // 修改 URL 处理方式
+        let urlString = request.url;
+        if (!urlString.startsWith('http')) {
+            // 从请求中获取 host
+            const host = request.headers?.host || context.ip || 'localhost';
+            urlString = `http://${host}${urlString}`;
+        }
+        const url = new URL(urlString);
+        
         const pathMatch = url.pathname.match(new RegExp(`${SETTINGS.XHTTP_PATH}/([^/]+)(?:/([0-9]+))?$`));
         
         if (!pathMatch) {
