@@ -234,32 +234,39 @@ export const handler = async (request: Request, context: Context) => {
     };
 
     try {
-        // 防护性检查
-        if (!request || !request.method) {
-            throw new Error('Invalid request object');
+        // 输出请求调试信息
+        log('debug', 'Request object:', {
+            method: request?.method,
+            url: request?.url,
+            path: context?.path
+        });
+        
+        // 确保请求方法存在
+        const method = request?.method || '';
+        
+        // 通过 context.geo 来验证请求是否有效
+        if (!context || !context.geo) {
+            throw new Error('Invalid context object');
         }
         
-        log('debug', `Processing ${request.method} request`);
+        log('debug', `Processing ${method} request`);
         
-        // 简单路径解析
-        const path = context.request?.url || context.url || '/';
-        log('info', `Request path: ${path}`);
+        // 解析路径 - 使用正则表达式直接匹配最后两个部分
+        const pathRegex = /\/([^\/]+)(?:\/(\d+))?$/;
+        const matches = (context.path || '').match(pathRegex);
         
-        // 简单分割路径并获取参数
-        const parts = path.split('/').filter(Boolean);
-        const uuid = parts[parts.length - 2]; // 倒数第二段为 uuid
-        const seqStr = parts[parts.length - 1]; // 最后一段为序号
-        
-        log('debug', `Path parts: ${parts.join(', ')}`);
-        log('debug', `UUID: ${uuid}, Seq: ${seqStr}`);
-
-        if (!uuid) {
-            log('warn', 'Missing UUID in path');
+        if (!matches) {
+            log('warn', 'Invalid path format');
             return new Response('Not Found', { status: 404 });
         }
 
+        const [, uuid, seqStr] = matches;
+        const seq = seqStr ? parseInt(seqStr) : null;
+
+        log('debug', `Parsed path params - UUID: ${uuid}, Sequence: ${seq}`);
+
         // GET 请求处理
-        if (request.method === 'GET') {
+        if (method === 'GET' && !seq) {
             log('info', `Creating new downstream for session ${uuid}`);
             let session = sessions.get(uuid);
             if (!session) {
@@ -272,7 +279,7 @@ export const handler = async (request: Request, context: Context) => {
         }
         
         // POST 请求处理
-        if (request.method === 'POST' && seqStr?.match(/^\d+$/)) {
+        if (method === 'POST' && typeof seq === 'number') {
             const seqNum = parseInt(seqStr);
             if (isNaN(seqNum)) {
                 return new Response('Bad Request', { status: 400 });
@@ -300,8 +307,7 @@ export const handler = async (request: Request, context: Context) => {
         log('warn', 'Request did not match any handler');
         return new Response('Not Found', { status: 404 });
     } catch (err) {
-        log('error', `Handler error: ${err.message}`);
-        log('error', err.stack || 'No stack trace available');
+        log('error', `Handler error details:`, err);
         return new Response('Internal Server Error', { 
             status: 500,
             headers: {
