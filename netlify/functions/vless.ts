@@ -274,16 +274,23 @@ export const handler = async (event: any) => {
             }
 
             try {
-                const body = await event.arrayBuffer();
-                if (!body) {
-                    throw new Error('Missing request body');
+                // 修改: 正确处理请求体
+                let buffer: ArrayBuffer;
+                if (event.body instanceof ArrayBuffer) {
+                    buffer = event.body;
+                } else if (typeof event.body === 'string') {
+                    buffer = new TextEncoder().encode(event.body).buffer;
+                } else if (event.rawBody) {
+                    // 尝试使用 rawBody
+                    buffer = typeof event.rawBody === 'string' 
+                        ? new TextEncoder().encode(event.rawBody).buffer
+                        : event.rawBody;
+                } else {
+                    throw new Error('Unsupported body format');
                 }
-                
-                const buffer = new Uint8Array(body);
+
                 log('debug', `Received packet size: ${buffer.byteLength}`);
-                
-                // 调用 vlessSession 处理数据
-                await session.vlessSession.processInbound(seq, buffer);
+                await session.vlessSession.processInbound(seq, new Uint8Array(buffer));
                 return new Response('OK', { status: 200, headers });
             } catch (err) {
                 log('error', `Failed to process packet: ${err.message}`);
