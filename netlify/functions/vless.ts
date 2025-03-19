@@ -19,48 +19,67 @@ function log(type: string, ...args: any[]) {
 }
 
 // VLESS 协议解析相关功能
+// 修改 UUID 解析函数
 function parseUUID(uuid: string): Uint8Array {
-    // 移除所有非十六进制字符
-    const cleanUUID = uuid.replace(/[^0-9a-fA-F]/g, '');
-    if (cleanUUID.length !== 32) {
-        throw new Error('Invalid UUID format');
-    }
-    
-    const r = new Uint8Array(16);
-    for (let i = 0; i < 16; i++) {
-        r[i] = parseInt(cleanUUID.slice(i * 2, (i + 1) * 2), 16);
-    }
-    return r;
-}
-
-function validateUUID(left: Uint8Array, right: Uint8Array): boolean {
-    if (left.length !== 16 || right.length !== 16) {
-        return false;
-    }
     try {
-        return left.every((val, idx) => val === right[idx]);
+        const cleanUUID = uuid.replace(/-/g, '');
+        const bytes = new Uint8Array(16);
+        
+        for (let i = 0; i < 16; i++) {
+            bytes[i] = parseInt(cleanUUID.substr(i * 2, 2), 16);
+        }
+        
+        log('debug', `Parsed UUID bytes: [${Array.from(bytes)}]`);
+        return bytes;
     } catch (err) {
-        log('error', 'UUID validation error:', err);
+        log('error', `UUID parse error: ${err.message}`);
+        throw new Error('Failed to parse UUID');
+    }
+}
+
+// 修改 UUID 验证函数
+function validateUUID(received: Uint8Array, expected: Uint8Array): boolean {
+    try {
+        if (received.length !== 16 || expected.length !== 16) {
+            log('error', `Invalid UUID length - received: ${received.length}, expected: 16`);
+            return false;
+        }
+
+        // 添加更多日志以便调试
+        const receivedHex = Array.from(received).map(b => b.toString(16).padStart(2, '0')).join('');
+        const expectedHex = Array.from(expected).map(b => b.toString(16).padStart(2, '0')).join('');
+        
+        log('debug', `Comparing UUIDs:`);
+        log('debug', `Received: ${receivedHex}`);
+        log('debug', `Expected: ${expectedHex}`);
+
+        return received.every((val, idx) => val === expected[idx]);
+    } catch (err) {
+        log('error', `UUID validation error: ${err.message}`);
         return false;
     }
 }
 
+// 修改头部解析中的 UUID 处理
 async function readVlessHeader(chunk: Uint8Array, uuid: string) {
     try {
-        // 确保数据长度足够
         if (chunk.length < 18) {
             throw new Error('Insufficient data length');
         }
 
         const version = chunk[0];
-        const uuidBytes = chunk.slice(1, 17);
-        log('debug', `Parsing UUID: ${uuid}`);
-        const requestUuid = parseUUID(uuid);
+        const receivedUUID = chunk.slice(1, 17);
+        log('debug', `Processing VLESS header - version: ${version}`);
         
-        if (!validateUUID(uuidBytes, requestUuid)) {
-            log('error', 'UUID validation failed');
-            log('debug', 'Expected:', Array.from(requestUuid));
-            log('debug', 'Received:', Array.from(uuidBytes));
+        // Base64 encode UUID for logging
+        const b64ReceivedUUID = btoa(String.fromCharCode(...receivedUUID));
+        log('debug', `Received UUID (base64): ${b64ReceivedUUID}`);
+        
+        const expectedUUID = parseUUID(uuid);
+        const b64ExpectedUUID = btoa(String.fromCharCode(...expectedUUID));
+        log('debug', `Expected UUID (base64): ${b64ExpectedUUID}`);
+
+        if (!validateUUID(receivedUUID, expectedUUID)) {
             throw new Error('Invalid UUID');
         }
 
