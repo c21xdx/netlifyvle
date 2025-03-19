@@ -40,6 +40,7 @@ const sessions = new Map<string, {
     target?: { host: string; port: number };
     pendingBuffers: Map<number, Buffer>;
     lastActive: number;
+    vlessResponse?: Buffer;    // 添加VLESS响应存储
 }>();
 
 // 添加连接黑名单
@@ -48,58 +49,15 @@ const blacklist = new Map<string, {
     lastFail: number;
 }>();
 
-// 修改连接配置
+// 优化连接配置
 const CONNECTION_CONFIG = {
-    TIMEOUT: 2000,          // 连接超时改为2秒
-    RETRY_TIMES: 1,         // 只重试一次
-    RETRY_DELAY: 500,       // 重试延迟改为0.5秒
-    BAN_TIME: 30000,        // 封禁时间改为30秒
-    MAX_FAIL_COUNT: 3,
+    TIMEOUT: 1000,          // 缩短超时到1秒
+    RETRY_TIMES: 1,         // 保持1次重试
+    RETRY_DELAY: 300,       // 减少重试延迟到300ms
+    BAN_TIME: 30000,        // 保持封禁时间30秒
+    MAX_FAIL_COUNT: 3,      // 保持最大失败次数
     WHITELIST: ['1.187.2.14', 'localhost', '127.0.0.1']
 };
-
-// 优化会话管理
-class SessionManager {
-    private static instance: SessionManager;
-    private sessions: Map<string, any>;
-    private cleanupInterval: NodeJS.Timeout;
-
-    private constructor() {
-        this.sessions = new Map();
-        this.cleanupInterval = setInterval(() => this.cleanup(), 5000);
-    }
-
-    static getInstance() {
-        if (!SessionManager.instance) {
-            SessionManager.instance = new SessionManager();
-        }
-        return SessionManager.instance;
-    }
-
-    get(uuid: string) {
-        return this.sessions.get(uuid);
-    }
-
-    set(uuid: string, session: any) {
-        this.sessions.set(uuid, session);
-    }
-
-    delete(uuid: string) {
-        this.sessions.delete(uuid);
-    }
-
-    private cleanup() {
-        const now = Date.now();
-        for (const [id, session] of this.sessions.entries()) {
-            if (now - session.lastActive > CONFIG.SESSION_TIMEOUT) {
-                session.socket?.destroy();
-                this.sessions.delete(id);
-            }
-        }
-    }
-}
-
-const sessionManager = SessionManager.getInstance();
 
 // 优化黑名单管理
 function checkBlacklist(host: string): boolean {
@@ -264,62 +222,39 @@ function validateUUID(test: Uint8Array, against: string): boolean {
     return true;
 }
 
-// 改进连接函数
+// 添加快速失败检测的连接函数
 async function connectToTarget(host: string, port: number): Promise<net.Socket> {
-    let lastError;
-    
-    // 添加快速失败检测
     if (!checkBlacklist(host)) {
         const record = blacklist.get(host);
         const remainingTime = Math.ceil((CONNECTION_CONFIG.BAN_TIME - (Date.now() - record!.lastFail)) / 1000);
         throw new Error(`Target blocked for ${remainingTime} seconds`);
     }
 
-    for (let i = 0; i <= CONNECTION_CONFIG.RETRY_TIMES; i++) {
-        try {
-            // 使用AbortController来实现快速超时
-            const abortController = new AbortController();
-            const timeoutId = setTimeout(() => abortController.abort(), CONNECTION_CONFIG.TIMEOUT);
+    return new Promise((resolve, reject) => {
+        const socket = net.createConnection({
+            host: host,
+            port: port,
+            timeout: CONNECTION_CONFIG.TIMEOUT
+        });
 
-            const socket = await new Promise<net.Socket>((resolve, reject) => {
-                const socket = net.createConnection({
-                    host: host,
-                    port: port
-                });
+        const timeoutId = setTimeout(() => {
+            socket.destroy();
+            reject(new Error('Connection timeout'));
+        }, CONNECTION_CONFIG.TIMEOUT);
 
-                socket.once('connect', () => {
-                    clearTimeout(timeoutId);
-                    socket.setTimeout(CONNECTION_CONFIG.TIMEOUT);
-                    resolve(socket);
-                });
-
-                socket.once('error', (err) => {
-                    clearTimeout(timeoutId);
-                    reject(err);
-                });
-
-                abortController.signal.addEventListener('abort', () => {
-                    socket.destroy();
-                    reject(new Error('Connection timeout'));
-                });
-            });
-
-            // 连接成功，重置黑名单
+        socket.once('connect', () => {
+            clearTimeout(timeoutId);
+            socket.setTimeout(0);  // 禁用socket超时
             blacklist.delete(host);
-            return socket;
+            resolve(socket);
+        });
 
-        } catch (err) {
-            lastError = err;
+        socket.once('error', (err) => {
+            clearTimeout(timeoutId);
             updateBlacklist(host);
-            
-            if (i < CONNECTION_CONFIG.RETRY_TIMES) {
-                log.info(`Retry attempt ${i + 1} for ${host}:${port}`);
-                await new Promise(r => setTimeout(r, CONNECTION_CONFIG.RETRY_DELAY));
-            }
-        }
-    }
-    
-    throw lastError;
+            reject(err);
+        });
+    });
 }
 
 // 分离超时连接逻辑
@@ -444,7 +379,7 @@ export const handler: Handler = async (event, context) => {
         // GET请求处理
         if (httpMethod === 'GET' && !seq) {
             log.info('Processing GET request for UUID:', uuid);
-            const session = sessionManager.get(uuid);
+            const session = sessions.get(uuid);
             
             if (!session?.socket || !session.target) {
                 log.warn('Session not found for GET request');
@@ -455,25 +390,23 @@ export const handler: Handler = async (event, context) => {
             headers['Content-Type'] = 'text/event-stream';
             headers['Transfer-Encoding'] = 'chunked';
 
-            // 创建流式响应
-            const stream = new ReadableStream({
-                start(controller) {
-                    session.socket!.on('data', (chunk) => {
-                        controller.enqueue(chunk);
-                    });
-                    session.socket!.on('end', () => {
-                        controller.close();
-                    });
-                    session.socket!.on('error', (err) => {
-                        controller.error(err);
-                    });
-                }
-            });
+            // 设置响应流
+            const { readable, writable } = new TransformStream();
+            
+            // 发送VLESS响应
+            if (session.vlessResponse) {
+                const writer = writable.getWriter();
+                await writer.write(session.vlessResponse);
+                writer.releaseLock();
+            }
+
+            // 转发数据
+            session.socket.pipe(writable);
 
             return {
                 statusCode: 200,
                 headers,
-                body: stream,
+                body: readable,
                 isBase64Encoded: false
             };
         }
@@ -481,7 +414,7 @@ export const handler: Handler = async (event, context) => {
         // POST请求处理
         if (httpMethod === 'POST' && seq !== null && body) {
             log.info('Processing POST request:', { uuid, seq });
-            let session = sessionManager.get(uuid);
+            let session = sessions.get(uuid);
 
             const data = Buffer.from(body, 'base64');
             log.debug('POST data size:', data.length);
@@ -529,10 +462,11 @@ export const handler: Handler = async (event, context) => {
                         nextSeq: 0,
                         target: vlessHeader.target,
                         pendingBuffers: new Map(),
-                        lastActive: Date.now()
+                        lastActive: Date.now(),
+                        vlessResponse: vlessHeader.resp  // 存储VLESS响应
                     };
 
-                    sessionManager.set(uuid, session);
+                    sessions.set(uuid, session);
                     log.info('New session created:', { uuid, target: vlessHeader.target });
 
                     if (vlessHeader.resp) {
@@ -570,7 +504,7 @@ export const handler: Handler = async (event, context) => {
             if (session.pendingBuffers.size > CONFIG.MAX_BUFFERED_POSTS) {
                 log.warn('Too many buffered posts:', session.pendingBuffers.size);
                 session.socket?.destroy();
-                sessionManager.delete(uuid);
+                sessions.delete(uuid);
                 return { statusCode: 429 };
             }
 
